@@ -1,0 +1,1 @@
+ALTER TABLE public.accounts ADD COLUMN transfer_charge numeric NOT NULL DEFAULT 0;

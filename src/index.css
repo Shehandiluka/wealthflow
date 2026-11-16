@@ -1,0 +1,163 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark navy base with an emerald accent. */
+    --background: 222 47% 7%;
+    --foreground: 210 30% 95%;
+
+    --card: 222 40% 10%;
+    --card-foreground: 210 30% 95%;
+
+    --popover: 222 40% 10%;
+    --popover-foreground: 210 30% 95%;
+
+    --primary: 158 58% 42%;
+    --primary-foreground: 160 30% 98%;
+
+    --secondary: 222 30% 15%;
+    --secondary-foreground: 210 25% 90%;
+
+    --muted: 222 28% 13%;
+    --muted-foreground: 215 18% 62%;
+
+    --accent: 158 58% 42%;
+    --accent-foreground: 160 30% 98%;
+
+    --destructive: 0 62% 54%;
+    --destructive-foreground: 0 0% 98%;
+
+    --success: 142 60% 45%;
+    --success-foreground: 222 47% 7%;
+
+    --warning: 38 85% 56%;
+    --warning-foreground: 222 47% 7%;
+
+    --border: 222 25% 18%;
+    --input: 222 25% 18%;
+    --ring: 158 58% 42%;
+
+    --radius: 0.5rem;
+
+    --sidebar-background: 222 50% 6%;
+    --sidebar-foreground: 210 22% 84%;
+    --sidebar-primary: 158 58% 42%;
+    --sidebar-primary-foreground: 160 30% 98%;
+    --sidebar-accent: 222 30% 12%;
+    --sidebar-accent-foreground: 210 25% 90%;
+    --sidebar-border: 222 25% 14%;
+    --sidebar-ring: 158 58% 42%;
+
+    /* Custom tokens */
+    --glass: 222 40% 10%;
+    --glass-border: 222 25% 18%;
+    --glow-primary: 158 58% 42%;
+    --gradient-start: 158 58% 42%;
+    --gradient-end: 190 70% 45%;
+  }
+
+  .light {
+    --background: 210 32% 97%;
+    --foreground: 222 45% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 45% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 45% 12%;
+
+    --primary: 158 64% 32%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 214 25% 92%;
+    --secondary-foreground: 222 40% 16%;
+
+    --muted: 214 25% 93%;
+    --muted-foreground: 220 12% 40%;
+
+    --accent: 158 64% 32%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 65% 45%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 62% 30%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 32 85% 38%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 214 20% 86%;
+    --input: 214 20% 86%;
+    --ring: 158 64% 32%;
+
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 222 35% 20%;
+    --sidebar-primary: 158 64% 32%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 214 25% 94%;
+    --sidebar-accent-foreground: 222 35% 18%;
+    --sidebar-border: 214 20% 88%;
+    --sidebar-ring: 158 64% 32%;
+
+    --glass: 0 0% 100%;
+    --glass-border: 214 20% 86%;
+    --glow-primary: 158 64% 32%;
+    --gradient-start: 158 64% 32%;
+    --gradient-end: 190 75% 34%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'IBM Plex Sans', sans-serif;
+  }
+
+  /* Fraunces carries the app's headline personality — used deliberately for
+     page titles and hero numbers, not sprinkled everywhere. */
+  .font-display {
+    font-family: 'Fraunces', 'IBM Plex Sans', serif;
+    font-optical-sizing: auto;
+  }
+}
+
+@layer utilities {
+  /* A ledger card: a plain surface with a hairline edge, not a blurred glass
+     panel — the precision of an instrument panel rather than decoration. */
+  .glass-card {
+    @apply bg-card border border-glass-border rounded-lg;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-colors duration-200 hover:border-primary/40;
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary to-gradient-end bg-clip-text text-transparent;
+  }
+
+  .gradient-border {
+    @apply border border-transparent bg-gradient-to-r from-primary/30 to-gradient-end/30;
+  }
+
+  .glow {
+    box-shadow: 0 0 20px hsl(var(--primary) / 0.15), 0 0 60px hsl(var(--primary) / 0.05);
+  }
+
+  .font-mono {
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}

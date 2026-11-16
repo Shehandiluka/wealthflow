@@ -1,0 +1,16 @@
+project_id = "ontlcjvmztiprmzbtcmh"
+
+[functions.scan-receipt]
+verify_jwt = false
+
+[functions.sms-import]
+verify_jwt = false
+
+[functions.send-debt-reminders]
+verify_jwt = false
+
+[functions.send-budget-alerts]
+verify_jwt = false
+
+[functions.telegram-bot]
+verify_jwt = false

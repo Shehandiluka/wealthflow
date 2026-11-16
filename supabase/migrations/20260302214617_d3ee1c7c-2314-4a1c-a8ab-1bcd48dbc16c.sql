@@ -1,0 +1,1 @@
+ALTER TABLE public.exchange_rates ADD CONSTRAINT exchange_rates_base_currency_unique UNIQUE (base_currency);
