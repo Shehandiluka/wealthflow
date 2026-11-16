@@ -1,11 +1,13 @@
 // WealthFlow Telegram bot — Supabase Edge Function (webhook).
 //
-// Works like the Quick Note: every entry is saved as a DRAFT in `sms_imports`
-// (sender "Telegram Note"). It never creates a transaction or touches a balance,
-// so you still Review & Confirm it in WealthFlow → SMS Imports (Draft Inbox).
+// Button-driven entry. The chat always shows three buttons:
+//   Expense · Income · Transfer
+// Tap one, then keep tapping: wallet -> (destination wallet | category) ->
+// type the amount -> optional note -> Save.
 //
-// Flow: send "1500 dry food" -> pick Income/Expense -> Currency -> Wallet
-//       -> Category (+ subcategory) -> Save as draft.
+// On Save the bot creates the transaction and updates the wallet balance(s)
+// in the same order the app does (insert row, then update_account_balance).
+// Only the chat ids in TELEGRAM_ALLOWED_CHAT_ID can use it.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 
@@ -25,37 +27,47 @@ const admin = createClient(SUPABASE_URL, SERVICE_ROLE, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-// ---------- small helpers ----------
+// ---------- types ----------
 
+type TxType = "expense" | "income" | "transfer";
 type Account = { id: string; name: string; currency: string; type: string };
 type Category = { id: string; name: string; parent_id: string | null; kind: string };
 
 type State = {
-  step: "type" | "currency" | "wallet" | "category" | "sub" | "confirm";
-  amount: number;
-  description: string;
-  hint: string | null; // currency typed inside the message, if any
-  guess: "income" | "expense";
-  type?: "income" | "expense";
-  currency?: string;
+  step: "wallet" | "to" | "category" | "sub" | "amount" | "received" | "note" | "confirm";
+  type: TxType;
   accountId?: string;
+  toAccountId?: string; // transfer only
   category?: string;
   parentId?: string; // while choosing a subcategory
+  amount?: number;
+  received?: number; // transfer between different currencies
+  description?: string;
+};
+
+type Button = { text: string; callback_data: string };
+
+// ---------- small helpers ----------
+
+const BTN_EXPENSE = "💸 Expense";
+const BTN_INCOME = "💰 Income";
+const BTN_TRANSFER = "🔁 Transfer";
+const MENU = {
+  keyboard: [[{ text: BTN_EXPENSE }, { text: BTN_INCOME }, { text: BTN_TRANSFER }]],
+  resize_keyboard: true,
+  is_persistent: true,
 };
 
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
-}
-
-async function sha256(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function tg(method: string, body: Record<string, unknown>) {
@@ -67,19 +79,13 @@ async function tg(method: string, body: Record<string, unknown>) {
   if (!resp.ok) console.error("telegram", method, resp.status, await resp.text());
 }
 
-type Button = { text: string; callback_data: string };
 const chunk = <T,>(arr: T[], n: number): T[][] => {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
   return out;
 };
 
-async function show(
-  chatId: number,
-  text: string,
-  rows: Button[][],
-  messageId?: number,
-) {
+async function show(chatId: number, text: string, rows: Button[][], messageId?: number) {
   const payload = {
     chat_id: chatId,
     text,
@@ -90,33 +96,22 @@ async function show(
   else await tg("sendMessage", payload);
 }
 
-// ---------- parsing the typed text ----------
-
-const CUR_MAP: Record<string, string> = {
-  LKR: "LKR", RS: "LKR", "RS.": "LKR", USD: "USD", "$": "USD", EUR: "EUR", "€": "EUR",
-  GBP: "GBP", "£": "GBP", ILS: "ILS", NIS: "ILS", "₪": "ILS", INR: "INR", "₹": "INR",
-  AED: "AED", SGD: "SGD",
-};
-const CUR_TOKENS = "LKR|Rs\\.?|INR|USD|EUR|GBP|AED|SGD|ILS|NIS|\\$|€|£|₹|₪";
-const AMOUNT_RE = new RegExp(
-  `(?<![A-Za-z])(${CUR_TOKENS})?\\s*(\\d[\\d,]*(?:\\.\\d{1,2})?)\\s*(?:(${CUR_TOKENS})(?![A-Za-z]))?`,
-  "i",
-);
-const INCOME_WORDS =
-  /\b(received|refund|salary|income|got paid|earned|credited|bonus|cashback|gift)\b/i;
-
-function parseText(text: string) {
-  const m = text.match(AMOUNT_RE);
-  if (!m) return null;
-  const amount = Number(m[2].replace(/,/g, ""));
-  if (!isFinite(amount) || amount <= 0) return null;
-  const raw = (m[1] ?? m[3] ?? "").toUpperCase();
-  const hint = raw ? CUR_MAP[raw] ?? null : null;
-  const description =
-    text.replace(m[0], " ").replace(/\s+/g, " ").trim() || "Telegram";
-  const guess: "income" | "expense" = INCOME_WORDS.test(text) ? "income" : "expense";
-  return { amount, hint, description, guess };
+async function sendMenu(chatId: number, text: string) {
+  await tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", reply_markup: MENU });
 }
+
+/** "1,500.50" / "Rs 1500" / "1500 LKR" -> 1500.5 ; null when there is no positive number. */
+function parseAmount(text: string): number | null {
+  const m = text.replace(/,/g, "").match(/\d+(?:\.\d{1,2})?/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  return isFinite(n) && n > 0 ? n : null;
+}
+
+const typeLabel = (t: TxType) =>
+  t === "income" ? BTN_INCOME : t === "transfer" ? BTN_TRANSFER : BTN_EXPENSE;
+const money = (n: number, c?: string) =>
+  `${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}${c ? " " + c : ""}`;
 
 // ---------- data access ----------
 
@@ -162,76 +157,108 @@ async function clearSession(chatId: number) {
   await admin.from("telegram_sessions").delete().eq("chat_id", chatId);
 }
 
+/** Today's date (YYYY-MM-DD) in the timezone saved in the user's reminder settings. */
+async function todayForUser(): Promise<string> {
+  let tz = "UTC";
+  try {
+    const { data } = await admin
+      .from("draft_reminder_settings")
+      .select("timezone")
+      .eq("user_id", USER_ID)
+      .maybeSingle();
+    if (data?.timezone) tz = data.timezone as string;
+  } catch (_) { /* fall back to UTC */ }
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
+  } catch (_) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+async function updateBalance(accountId: string, amount: number) {
+  const { error } = await admin.rpc("update_account_balance", {
+    _account_id: accountId,
+    _amount: amount,
+  });
+  if (error) throw error;
+}
+
 // ---------- the conversation ----------
 
 const FALLBACK_EXPENSE = ["Food", "Transport", "Shopping", "Utilities", "Health", "Entertainment"];
 const FALLBACK_INCOME = ["Salary", "Freelance", "Gifts Received", "Refunds"];
 
-const typeLabel = (t?: string) => (t === "income" ? "💰 Income" : "💸 Expense");
-const money = (n: number, c?: string) =>
-  `${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}${c ? " " + c : ""}`;
-
-/** Fill in every step that has only one sensible answer, stop at the first real choice. */
-function settle(st: State, accounts: Account[], cats: Category[]) {
-  if (!st.type) { st.step = "type"; return; }
-
-  const currencies = [...new Set(accounts.map((a) => a.currency))];
-  if (!st.currency) {
-    if (st.hint && currencies.includes(st.hint)) st.currency = st.hint;
-    else if (currencies.length === 1) st.currency = currencies[0];
-    else { st.step = "currency"; return; }
-  }
-
+/** Decide which question comes next. Steps with a single possible answer are filled in. */
+function settle(st: State, accounts: Account[]) {
   if (!st.accountId) {
-    const wallets = accounts.filter((a) => a.currency === st.currency);
-    if (wallets.length === 1) st.accountId = wallets[0].id;
+    if (accounts.length === 1 && st.type !== "transfer") st.accountId = accounts[0].id;
     else { st.step = "wallet"; return; }
   }
 
-  if (!st.category) {
+  if (st.type === "transfer") {
+    if (!st.toAccountId) {
+      const others = accounts.filter((a) => a.id !== st.accountId);
+      if (others.length === 1) st.toAccountId = others[0].id;
+      else { st.step = "to"; return; }
+    }
+  } else if (!st.category) {
     st.step = st.parentId ? "sub" : "category";
-    void cats;
     return;
   }
+
+  if (st.amount == null) { st.step = "amount"; return; }
+
+  if (st.type === "transfer" && st.received == null) {
+    const from = accounts.find((a) => a.id === st.accountId);
+    const to = accounts.find((a) => a.id === st.toAccountId);
+    if (from && to && from.currency !== to.currency) { st.step = "received"; return; }
+  }
+
+  if (st.description == null) { st.step = "note"; return; }
   st.step = "confirm";
 }
 
 function view(st: State, accounts: Account[], cats: Category[]): { text: string; rows: Button[][] } {
-  const head = `💬 <b>${money(st.amount, st.currency ?? st.hint ?? undefined)}</b> — ${esc(st.description)}`;
-  const cancel: Button[] = [{ text: "❌ Cancel", callback_data: "x" }];
+  const cancel: Button = { text: "❌ Cancel", callback_data: "x" };
+  const from = accounts.find((a) => a.id === st.accountId);
+  const to = accounts.find((a) => a.id === st.toAccountId);
 
-  if (st.step === "type") {
-    const order: ("expense" | "income")[] = st.guess === "income" ? ["income", "expense"] : ["expense", "income"];
-    return {
-      text: `${head}\n\nමේක මොන වර්ගයේද?`,
-      rows: [
-        order.map((t) => ({ text: typeLabel(t), callback_data: t === "income" ? "t:i" : "t:e" })),
-        cancel,
-      ],
-    };
-  }
+  // What has been chosen so far, shown above every question.
+  const lines = [`<b>${typeLabel(st.type)}</b>`];
+  if (from) lines.push(`${st.type === "transfer" ? "From" : "Wallet"}: ${esc(from.name)} (${from.currency})`);
+  if (to) lines.push(`To: ${esc(to.name)} (${to.currency})`);
+  if (st.category) lines.push(`Category: ${esc(st.category)}`);
+  if (st.amount != null) lines.push(`Amount: <b>${money(st.amount, from?.currency)}</b>`);
+  if (st.received != null) lines.push(`Received: <b>${money(st.received, to?.currency)}</b>`);
+  if (st.description) lines.push(`Note: ${esc(st.description)}`);
+  const head = lines.join("\n");
 
-  if (st.step === "currency") {
-    const currencies = [...new Set(accounts.map((a) => a.currency))];
-    return {
-      text: `${head}\n${typeLabel(st.type)}\n\nකරන්සිය තෝරන්න:`,
-      rows: [...chunk(currencies.map((c) => ({ text: c, callback_data: `c:${c}` })), 3), cancel],
-    };
-  }
+  const walletButtons = (list: Account[], prefix: string) =>
+    chunk(
+      list.map((a) => ({
+        text: `${a.name} (${a.currency})`,
+        callback_data: `${prefix}:${a.id.slice(0, 8)}`,
+      })),
+      2,
+    );
 
   if (st.step === "wallet") {
-    const wallets = accounts.filter((a) => a.currency === st.currency);
+    const q = st.type === "transfer"
+      ? "කොයි wallet එකෙන්ද යවන්නේ?"
+      : st.type === "income" ? "කොයි wallet එකටද ලැබුණේ?" : "කොයි wallet එකෙන්ද ගෙව්වේ?";
+    return { text: `${head}\n\n${q}`, rows: [...walletButtons(accounts, "a"), [cancel]] };
+  }
+
+  if (st.step === "to") {
+    const others = accounts.filter((a) => a.id !== st.accountId);
     return {
-      text: `${head}\n${typeLabel(st.type)} · ${st.currency}\n\nගිණුම (wallet) තෝරන්න:`,
-      rows: [
-        ...chunk(wallets.map((a) => ({ text: a.name, callback_data: `a:${a.id.slice(0, 8)}` })), 2),
-        cancel,
-      ],
+      text: `${head}\n\nකොයි wallet එකටද යවන්නේ?`,
+      rows: [...walletButtons(others, "d"), [cancel]],
     };
   }
 
   if (st.step === "category") {
-    const kind = st.type!;
+    const kind = st.type;
     const parents = cats.filter((c) => !c.parent_id && (c.kind === kind || c.kind === "both"));
     const other = kind === "income" ? "Other Income" : "Other";
     const buttons: Button[] = parents.length
@@ -240,127 +267,179 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
           text: n, callback_data: `f:${n}`,
         }));
     if (!parents.some((c) => c.name === other)) buttons.push({ text: other, callback_data: `f:${other}` });
-    return {
-      text: `${head}\n${typeLabel(st.type)} · ${st.currency}\n\nප්‍රවර්ගය (category) තෝරන්න:`,
-      rows: [...chunk(buttons, 2), cancel],
-    };
+    return { text: `${head}\n\nCategory එක තෝරන්න:`, rows: [...chunk(buttons, 2), [cancel]] };
   }
 
   if (st.step === "sub") {
     const parent = cats.find((c) => c.id === st.parentId);
     const kids = cats.filter((c) => c.parent_id === st.parentId);
     return {
-      text: `${head}\n${typeLabel(st.type)} · ${st.currency}\n\n<b>${esc(parent?.name ?? "")}</b> — උප ප්‍රවර්ගය තෝරන්න:`,
+      text: `${head}\n\n<b>${esc(parent?.name ?? "")}</b> — sub-category එක තෝරන්න:`,
       rows: [
         [{ text: `${parent?.name ?? ""} (General)`, callback_data: "g" }],
         ...chunk(kids.map((c) => ({ text: c.name, callback_data: `s:${c.id.slice(0, 8)}` })), 2),
-        [{ text: "↩️ Back", callback_data: "bk" }, cancel[0]],
+        [{ text: "↩️ Back", callback_data: "bk" }, cancel],
       ],
     };
   }
 
-  const wallet = accounts.find((a) => a.id === st.accountId);
+  if (st.step === "amount") {
+    return {
+      text: `${head}\n\n✏️ මුදල type කරලා එවන්න (${from?.currency ?? ""}). උදා: <code>1500</code>`,
+      rows: [[cancel]],
+    };
+  }
+
+  if (st.step === "received") {
+    return {
+      text:
+        `${head}\n\n✏️ Wallet දෙකේ කරන්සි වෙනස්. <b>${esc(to?.name ?? "")}</b> එකට ලැබුණු මුදල ` +
+        `(${to?.currency ?? ""}) type කරලා එවන්න.`,
+      rows: [[cancel]],
+    };
+  }
+
+  if (st.step === "note") {
+    return {
+      text: `${head}\n\n📝 Note එකක් type කරලා එවන්න, නැත්නම් Skip එබුවා.`,
+      rows: [[{ text: "⏭ Skip", callback_data: "n" }], [cancel]],
+    };
+  }
+
   return {
-    text:
-      `📝 <b>Draft සාරාංශය</b>\n\n` +
-      `වර්ගය: ${typeLabel(st.type)}\n` +
-      `ප්‍රමාණය: <b>${money(st.amount, st.currency)}</b>\n` +
-      `ගිණුම: ${esc(wallet?.name ?? "?")}\n` +
-      `ප්‍රවර්ගය: ${esc(st.category ?? "?")}\n` +
-      `විස්තරය: ${esc(st.description)}\n\n` +
-      `Draft Inbox එකට සේව් කරන්නද?`,
-    rows: [
-      [{ text: "✅ Save as draft", callback_data: "ok" }],
-      [{ text: "🔁 Start over", callback_data: "r" }, cancel[0]],
-    ],
+    text: `${head}\n\nSave කරන්නද?`,
+    rows: [[{ text: "✅ Save", callback_data: "ok" }], [cancel]],
   };
 }
 
-async function saveDraft(st: State): Promise<string> {
-  const message = `${st.amount} ${st.currency} ${st.description}`.trim().slice(0, 4000);
-  const receivedAt = new Date().toISOString();
-  // Same convention as the in-app Quick Note: the timestamp is part of the hash,
-  // so typing the same note twice gives two drafts.
-  const contentHash = await sha256(`${USER_ID}|note|telegram|${message}|${receivedAt}`);
+/**
+ * Create the transaction and apply its balance effect — the same sequence the
+ * app uses: insert the row first, then update_account_balance. If a balance
+ * update fails, what was already applied is undone so nothing is left half-saved.
+ */
+async function postTransaction(st: State, accounts: Account[]): Promise<void> {
+  const from = accounts.find((a) => a.id === st.accountId);
+  if (!from || st.amount == null) throw new Error("incomplete entry");
+  const amount = round2(st.amount);
 
-  const { data, error } = await admin
-    .from("sms_imports")
-    .insert({
-      user_id: USER_ID,
-      sender: "Telegram Note",
-      message,
-      received_at: receivedAt,
-      content_hash: contentHash,
-      parsed_amount: st.amount,
-      parsed_type: st.type,
-      parsed_account_ref: null,
-      parsed_balance: null,
-      parsed_date: null,
-      status: "draft",
-      suggested_account_id: st.accountId ?? null,
-      suggested_category: st.category ?? null,
-    })
-    .select("id")
-    .single();
+  const row: Record<string, unknown> = {
+    user_id: USER_ID,
+    account_id: from.id,
+    type: st.type,
+    amount,
+    currency: from.currency,
+    category: st.type === "transfer" ? "Transfer" : st.category ?? "Other",
+    description: st.description ?? "",
+    date: await todayForUser(),
+  };
+
+  let credit = 0; // what the destination wallet receives (transfer only)
+  let to: Account | undefined;
+  if (st.type === "transfer") {
+    to = accounts.find((a) => a.id === st.toAccountId);
+    if (!to || to.id === from.id) throw new Error("invalid destination wallet");
+    row.to_account_id = to.id;
+    if (from.currency !== to.currency) {
+      if (st.received == null) throw new Error("missing received amount");
+      row.exchange_rate = st.received / amount;
+      credit = amount * (st.received / amount);
+    } else {
+      credit = amount;
+    }
+  }
+
+  const { data, error } = await admin.from("transactions").insert(row).select("id").single();
   if (error || !data) throw error ?? new Error("insert failed");
-  return data.id as string;
-}
+  const txId = data.id as string;
 
-const HELP =
-  "👋 <b>WealthFlow Quick Note bot</b>\n\n" +
-  "ගනුදෙනුවක් එවන්න — උදා:\n" +
-  "<code>1500 dry food</code>\n" +
-  "<code>2000 LKR salary</code>\n" +
-  "<code>50 ILS taxi</code>\n\n" +
-  "ඊට පස්සේ බොත්තම් වලින් Income/Expense, කරන්සිය, ගිණුම, ප්‍රවර්ගය තෝරන්න. " +
-  "සේව් වෙන්නේ <b>Draft</b> එකක් විදිහට — WealthFlow → SMS Imports එකෙන් Confirm කරන්න.\n\n" +
-  "/cancel — වත්මන් එක අත්හරින්න · /id — ඔබේ chat id";
+  const sign = st.type === "income" ? 1 : -1;
+  try {
+    await updateBalance(from.id, amount * sign);
+  } catch (e) {
+    await admin.from("transactions").delete().eq("id", txId);
+    throw e;
+  }
+
+  if (st.type === "transfer" && to) {
+    try {
+      await updateBalance(to.id, credit);
+    } catch (e) {
+      // Undo the debit and the row so the two wallets stay consistent.
+      try { await updateBalance(from.id, -amount * sign); } catch (e2) { console.error("undo failed", e2); }
+      await admin.from("transactions").delete().eq("id", txId);
+      throw e;
+    }
+  }
+}
 
 // ---------- update handling ----------
 
+const WELCOME =
+  "👋 <b>WealthFlow bot</b>\n\nයට තියෙන බොත්තම් තුනෙන් එකක් තෝරන්න: " +
+  "Expense, Income, Transfer.\nඊට පස්සේ බොත්තම් වලින්ම ඉස්සරහට යන්න.";
+
+async function startEntry(chatId: number, type: TxType) {
+  const accounts = await loadAccounts();
+  if (accounts.length === 0) {
+    await sendMenu(chatId, "WealthFlow එකේ තවම wallet එකක් නැහැ. මුලින් app එකේ Accounts වල එකක් හදන්න.");
+    return;
+  }
+  if (type === "transfer" && accounts.length < 2) {
+    await sendMenu(chatId, "Transfer එකකට wallet දෙකක්වත් ඕන.");
+    return;
+  }
+  const cats = type === "transfer" ? [] : await loadCategories();
+  const st: State = { step: "wallet", type };
+  settle(st, accounts);
+  await saveSession(chatId, st);
+  const v = view(st, accounts, cats);
+  await show(chatId, v.text, v.rows);
+}
+
 async function onText(chatId: number, text: string) {
-  const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/@\w+$/, "");
+  const t = text.trim();
+  const cmd = t.split(/\s+/)[0].toLowerCase().replace(/@\w+$/, "");
 
   if (cmd === "/start" || cmd === "/help") {
-    await tg("sendMessage", { chat_id: chatId, text: HELP, parse_mode: "HTML" });
+    await clearSession(chatId);
+    await sendMenu(chatId, WELCOME);
     return;
   }
   if (cmd === "/cancel") {
     await clearSession(chatId);
-    await tg("sendMessage", { chat_id: chatId, text: "අත්හැරියා ✅" });
+    await sendMenu(chatId, "අත්හැරියා ✅");
+    return;
+  }
+  if (t === BTN_EXPENSE || cmd === "/expense") return startEntry(chatId, "expense");
+  if (t === BTN_INCOME || cmd === "/income") return startEntry(chatId, "income");
+  if (t === BTN_TRANSFER || cmd === "/transfer") return startEntry(chatId, "transfer");
+
+  // Otherwise the text is an answer to "type the amount" / "type a note".
+  const st = await loadSession(chatId);
+  if (!st || !["amount", "received", "note"].includes(st.step)) {
+    await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Transfer.");
     return;
   }
 
-  const parsed = parseText(text);
-  if (!parsed) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: "ප්‍රමාණය (අංකයක්) හොයාගන්න බැරි වුණා. උදා: <code>1500 dry food</code>",
-      parse_mode: "HTML",
-    });
-    return;
+  if (st.step === "note") {
+    st.description = t.slice(0, 200);
+  } else {
+    const n = parseAmount(t);
+    if (n == null) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: "ඒක මුදලක් විදියට කියවන්න බැරි උනා. ඉලක්කම් විතරක් එවන්න, උදා: 1500",
+      });
+      return;
+    }
+    if (st.step === "amount") st.amount = n;
+    else st.received = n;
   }
 
   const accounts = await loadAccounts();
-  if (accounts.length === 0) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: "WealthFlow එකේ තවම ගිණුමක් (wallet) නැහැ. මුලින් app එකේ Accounts වල එකක් හදන්න.",
-    });
-    return;
-  }
-  const cats = await loadCategories();
-
-  const st: State = {
-    step: "type",
-    amount: parsed.amount,
-    description: parsed.description,
-    hint: parsed.hint,
-    guess: parsed.guess,
-  };
-  settle(st, accounts, cats);
+  settle(st, accounts);
   await saveSession(chatId, st);
-  const v = view(st, accounts, cats);
+  const v = view(st, accounts, []);
   await show(chatId, v.text, v.rows);
 }
 
@@ -376,75 +455,71 @@ async function onCallback(chatId: number, messageId: number, data: string) {
     await tg("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
-      text: "මේ entry එක කල් ඉකුත් වෙලා හෝ දැනටමත් සේව් වෙලා. අලුතින් එවන්න.",
+      text: "මේ entry එක කල් ඉකුත් වෙලා හෝ දැනටමත් save වෙලා. යට බොත්තමකින් අලුතින් පටන් ගන්න.",
     });
     return;
   }
 
   const accounts = await loadAccounts();
-  const cats = await loadCategories();
+  const cats = st.type === "transfer" ? [] : await loadCategories();
 
   if (data === "ok") {
     if (st.step !== "confirm") return;
-    // Clear first so a double tap cannot save the same draft twice.
+    // Clear first so a double tap cannot save the same transaction twice.
     await clearSession(chatId);
+    const summary = view({ ...st, step: "confirm" }, accounts, cats).text.replace(/\n\nSave කරන්නද\?$/, "");
     try {
-      await saveDraft(st);
+      await postTransaction(st, accounts);
     } catch (e) {
-      console.error("saveDraft", e);
+      console.error("postTransaction", e);
       await tg("editMessageText", {
-        chat_id: chatId, message_id: messageId,
-        text: "⚠️ Draft එක සේව් කරන්න බැරි වුණා. ටික වේලාවකින් අලුතින් එවන්න.",
+        chat_id: chatId,
+        message_id: messageId,
+        text: "⚠️ Save කරන්න බැරි උනා, කිසිම දෙයක් වෙනස් වෙලා නැහැ. ආයෙ උත්සාහ කරන්න.",
       });
       return;
     }
-    const wallet = accounts.find((a) => a.id === st.accountId);
     await tg("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: "HTML",
-      text:
-        `✅ <b>Draft එකට දැම්මා</b>\n${typeLabel(st.type)} · <b>${money(st.amount, st.currency)}</b>\n` +
-        `${esc(wallet?.name ?? "")} · ${esc(st.category ?? "")}\n${esc(st.description)}\n\n` +
-        `WealthFlow → SMS Imports එකෙන් Review & Confirm කරන්න.`,
+      text: `✅ <b>Save උනා</b>\n\n${summary}`,
     });
     return;
   }
 
-  if (data === "r") {
-    delete st.type; delete st.currency; delete st.accountId; delete st.category; delete st.parentId;
-  } else if (data.startsWith("t:")) {
-    st.type = data === "t:i" ? "income" : "expense";
-    delete st.category; delete st.parentId;
-  } else if (data.startsWith("c:")) {
-    st.currency = data.slice(2);
-    delete st.accountId;
-  } else if (data.startsWith("a:")) {
-    const p = data.slice(2);
-    const acc = accounts.find((a) => a.id.startsWith(p) && a.currency === st.currency);
+  // Each button only counts on the step it belongs to, so an old message's
+  // buttons cannot change a later step.
+  if (data.startsWith("a:") && st.step === "wallet") {
+    const acc = accounts.find((a) => a.id.startsWith(data.slice(2)));
     if (acc) st.accountId = acc.id;
-  } else if (data.startsWith("k:")) {
-    const p = data.slice(2);
-    const parent = cats.find((c) => !c.parent_id && c.id.startsWith(p));
+  } else if (data.startsWith("d:") && st.step === "to") {
+    const acc = accounts.find((a) => a.id.startsWith(data.slice(2)) && a.id !== st.accountId);
+    if (acc) st.toAccountId = acc.id;
+  } else if (data.startsWith("k:") && st.step === "category") {
+    const parent = cats.find((c) => !c.parent_id && c.id.startsWith(data.slice(2)));
     if (parent) {
       if (cats.some((c) => c.parent_id === parent.id)) st.parentId = parent.id;
       else st.category = parent.name;
     }
-  } else if (data.startsWith("s:")) {
-    const p = data.slice(2);
-    const child = cats.find((c) => c.parent_id === st.parentId && c.id.startsWith(p));
+  } else if (data.startsWith("f:") && st.step === "category") {
+    st.category = data.slice(2);
+  } else if (data.startsWith("s:") && st.step === "sub") {
+    const child = cats.find((c) => c.parent_id === st.parentId && c.id.startsWith(data.slice(2)));
     const parent = cats.find((c) => c.id === st.parentId);
     if (child && parent) { st.category = `${parent.name} > ${child.name}`; delete st.parentId; }
-  } else if (data === "g") {
+  } else if (data === "g" && st.step === "sub") {
     const parent = cats.find((c) => c.id === st.parentId);
     if (parent) { st.category = parent.name; delete st.parentId; }
-  } else if (data === "bk") {
+  } else if (data === "bk" && st.step === "sub") {
     delete st.parentId;
-  } else if (data.startsWith("f:")) {
-    st.category = data.slice(2);
+  } else if (data === "n" && st.step === "note") {
+    st.description = "";
+  } else {
+    return; // a button from an earlier step — ignore it
   }
 
-  settle(st, accounts, cats);
+  settle(st, accounts);
   await saveSession(chatId, st);
   const v = view(st, accounts, cats);
   await show(chatId, v.text, v.rows, messageId);
@@ -466,7 +541,7 @@ async function handle(update: any) {
         parse_mode: "HTML",
         text:
           "🚫 මේ bot එක පෞද්ගලිකයි.\nඔබේ chat id: <code>" + chatId +
-          "</code>\n(හිමිකරු මේක TELEGRAM_ALLOWED_CHAT_ID එකට එකතු කළ යුතුයි.)",
+          "</code>\n(මේ අංකය TELEGRAM_ALLOWED_CHAT_ID secret එකට දාන්න.)",
       });
     }
     return;
