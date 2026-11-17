@@ -1,7 +1,9 @@
 // WealthFlow Telegram bot — Supabase Edge Function (webhook).
 //
 // Button-driven entry. The chat always shows three buttons:
-//   Expense · Income · Transfer
+//   Expense · Income · Menu
+// Menu holds everything else: Transfer, Balances, Recent, Today, This month,
+// Budgets, Drafts and Undo last.
 // Tap one, then keep tapping: wallet -> (destination wallet | category) ->
 // type the amount -> optional note -> Save.
 // The category screen lists every category and subcategory at once, and
@@ -56,8 +58,9 @@ type Button = { text: string; callback_data: string };
 const BTN_EXPENSE = "💸 Expense";
 const BTN_INCOME = "💰 Income";
 const BTN_TRANSFER = "🔁 Transfer";
+const BTN_MENU = "☰ Menu";
 const MENU = {
-  keyboard: [[{ text: BTN_EXPENSE }, { text: BTN_INCOME }, { text: BTN_TRANSFER }]],
+  keyboard: [[{ text: BTN_EXPENSE }, { text: BTN_INCOME }, { text: BTN_MENU }]],
   resize_keyboard: true,
   is_persistent: true,
 };
@@ -424,13 +427,275 @@ async function postTransaction(st: State, accounts: Account[]): Promise<void> {
   }
 }
 
+// ---------- menu: reports and undo ----------
+
+const MENU_ROWS: Button[][] = [
+  [{ text: BTN_TRANSFER, callback_data: "m:tr" }],
+  [{ text: "💼 Balances", callback_data: "m:bal" }, { text: "🧾 Recent", callback_data: "m:rec" }],
+  [{ text: "📊 Today", callback_data: "m:day" }, { text: "📅 This month", callback_data: "m:mon" }],
+  [{ text: "🎯 Budgets", callback_data: "m:bud" }, { text: "📥 Drafts", callback_data: "m:dr" }],
+  [{ text: "↩️ Undo last", callback_data: "m:undo" }],
+];
+const MENU_TEXT = "<b>☰ Menu</b>\n\nතෝරන්න:";
+const BACK: Button[][] = [[{ text: BTN_MENU, callback_data: "m" }]];
+
+// deno-lint-ignore no-explicit-any
+type Tx = Record<string, any>;
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const shortDate = (iso: string) => `${Number(iso.slice(8, 10))} ${MONTHS[Number(iso.slice(5, 7)) - 1] ?? ""}`;
+
+function txLine(tx: Tx, names: Map<string, string>): string {
+  const amt = money(Number(tx.amount), tx.currency);
+  const note = tx.description ? ` — ${esc(String(tx.description).slice(0, 40))}` : "";
+  if (tx.type === "transfer") {
+    const a = esc(names.get(tx.account_id) ?? "?");
+    const b = esc(names.get(tx.to_account_id) ?? "?");
+    return `${shortDate(tx.date)} · 🔁 ${amt} · ${a} → ${b}${note}`;
+  }
+  const sign = tx.type === "income" ? "+" : "−";
+  return `${shortDate(tx.date)} · ${sign}${amt} · ${esc(tx.category ?? "")}${note}`;
+}
+
+async function accountNames(): Promise<Map<string, string>> {
+  return new Map((await loadAccounts()).map((a) => [a.id, a.name]));
+}
+
+async function reportBalances(): Promise<string> {
+  const { data, error } = await admin
+    .from("accounts")
+    .select("name, currency, balance")
+    .eq("user_id", USER_ID)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  const rows = (data ?? []) as { name: string; currency: string; balance: number }[];
+  if (!rows.length) return "💼 <b>Balances</b>\n\nWallet එකක්වත් නැහැ.";
+  const totals = new Map<string, number>();
+  const lines = rows.map((a) => {
+    totals.set(a.currency, (totals.get(a.currency) ?? 0) + Number(a.balance));
+    return `${esc(a.name)} — <b>${money(Number(a.balance), a.currency)}</b>`;
+  });
+  const totalLines = [...totals].map(([c, n]) => `Total ${c}: <b>${money(round2(n), c)}</b>`);
+  return `💼 <b>Balances</b>\n\n${lines.join("\n")}\n\n${totalLines.join("\n")}`;
+}
+
+/** Income, expenses and net per currency for a date range, with the top expense categories. */
+async function reportSummary(title: string, from: string, to: string): Promise<string> {
+  const { data, error } = await admin
+    .from("transactions")
+    .select("type, amount, currency, category")
+    .eq("user_id", USER_ID)
+    .gte("date", from)
+    .lte("date", to);
+  if (error) throw error;
+  const rows = ((data ?? []) as Tx[]).filter((t) => t.type === "income" || t.type === "expense");
+  if (!rows.length) return `${title}\n\nIncome හෝ expense එකක්වත් නැහැ.`;
+
+  const blocks: string[] = [];
+  for (const cur of [...new Set(rows.map((t) => t.currency as string))]) {
+    const mine = rows.filter((t) => t.currency === cur);
+    const sum = (type: string) =>
+      round2(mine.filter((t) => t.type === type).reduce((n, t) => n + Number(t.amount), 0));
+    const income = sum("income");
+    const expense = sum("expense");
+    const byCat = new Map<string, number>();
+    for (const t of mine) {
+      if (t.type === "expense") byCat.set(t.category, (byCat.get(t.category) ?? 0) + Number(t.amount));
+    }
+    const top = [...byCat].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([c, n]) => `  • ${esc(c)} — ${money(round2(n))}`);
+    blocks.push(
+      `<b>${cur}</b>\n💰 Income: ${money(income)}\n💸 Expense: ${money(expense)}\n` +
+      `Net: <b>${money(round2(income - expense))}</b>` +
+      (top.length ? `\nවැඩිම වියදම්:\n${top.join("\n")}` : ""),
+    );
+  }
+  return `${title}\n\n${blocks.join("\n\n")}`;
+}
+
+async function reportRecent(): Promise<string> {
+  const { data, error } = await admin
+    .from("transactions")
+    .select("type, amount, currency, category, description, date, account_id, to_account_id, created_at")
+    .eq("user_id", USER_ID)
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) throw error;
+  const rows = (data ?? []) as Tx[];
+  if (!rows.length) return "🧾 <b>Recent</b>\n\nගනුදෙනු නැහැ.";
+  const names = await accountNames();
+  return `🧾 <b>Recent</b> (අන්තිම ${rows.length})\n\n${rows.map((t) => txLine(t, names)).join("\n")}`;
+}
+
+/** This month's spend against each budget — same rule as the app: exact category, same currency. */
+async function reportBudgets(today: string): Promise<string> {
+  const { data: budgets, error } = await admin
+    .from("budgets")
+    .select("category, monthly_limit, currency")
+    .eq("user_id", USER_ID)
+    .order("category", { ascending: true });
+  if (error) throw error;
+  const list = (budgets ?? []) as { category: string; monthly_limit: number; currency: string }[];
+  if (!list.length) return "🎯 <b>Budgets</b>\n\nBudget එකක්වත් නැහැ. App එකේ Budgets වලින් හදන්න.";
+
+  const { data: txs, error: e2 } = await admin
+    .from("transactions")
+    .select("category, amount, currency, type")
+    .eq("user_id", USER_ID)
+    .eq("type", "expense")
+    .gte("date", `${today.slice(0, 7)}-01`)
+    .lte("date", today);
+  if (e2) throw e2;
+  const spent = new Map<string, number>();
+  for (const t of (txs ?? []) as Tx[]) {
+    const k = `${t.category}::${t.currency}`;
+    spent.set(k, (spent.get(k) ?? 0) + Number(t.amount));
+  }
+  const lines = list.map((b) => {
+    const used = round2(spent.get(`${b.category}::${b.currency}`) ?? 0);
+    const limit = Number(b.monthly_limit);
+    const pct = limit > 0 ? Math.round((used / limit) * 100) : 0;
+    const mark = pct >= 100 ? "🔴" : pct >= 80 ? "⚠️" : "✅";
+    return `${mark} ${esc(b.category)} — ${money(used)} / ${money(limit, b.currency)} (${pct}%)`;
+  });
+  return `🎯 <b>Budgets</b> (මේ මාසය)\n\n${lines.join("\n")}`;
+}
+
+async function reportDrafts(): Promise<string> {
+  const { data, error } = await admin
+    .from("sms_imports")
+    .select("sender, parsed_amount, parsed_type, message, received_at, status")
+    .eq("user_id", USER_ID)
+    .in("status", ["draft", "unparsed"])
+    .order("received_at", { ascending: false })
+    .limit(50);
+  if (error) throw error;
+  const rows = (data ?? []) as Tx[];
+  if (!rows.length) return "📥 <b>Drafts</b>\n\nConfirm කරන්න තියෙන draft නැහැ ✅";
+  const lines = rows.slice(0, 8).map((d) => {
+    const amt = d.parsed_amount != null ? money(Number(d.parsed_amount)) : "?";
+    return `• ${amt} · ${esc(String(d.sender))} — ${esc(String(d.message).slice(0, 45))}`;
+  });
+  const more = rows.length > 8 ? `\n… තව ${rows.length - 8}${rows.length === 50 ? "+" : ""}` : "";
+  return `📥 <b>Drafts</b> (${rows.length}${rows.length === 50 ? "+" : ""})\n\n${lines.join("\n")}${more}\n\n` +
+    "Confirm කරන්න WealthFlow → Draft Inbox එකට යන්න.";
+}
+
+async function lastTransaction(): Promise<Tx | null> {
+  const { data, error } = await admin
+    .from("transactions")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return ((data ?? []) as Tx[])[0] ?? null;
+}
+
+/**
+ * Delete the most recent transaction and put the wallet balance(s) back —
+ * the reverse of what saving did. The row is removed first, and only the call
+ * that actually removed it reverses the balances, so a double tap cannot
+ * reverse twice. If a balance update fails the row is restored.
+ */
+async function undoTransaction(tx: Tx): Promise<boolean> {
+  const { data, error } = await admin.from("transactions").delete().eq("id", tx.id).select("id");
+  if (error) throw error;
+  if (!data || (data as Tx[]).length === 0) return false; // already removed
+
+  const amount = Number(tx.amount);
+  const sign = tx.type === "income" ? -1 : 1;
+  const restore = async () => {
+    const { error: e } = await admin.from("transactions").insert(tx);
+    if (e) console.error("could not restore transaction", tx.id, e);
+  };
+  try {
+    await updateBalance(tx.account_id, amount * sign);
+  } catch (e) {
+    await restore();
+    throw e;
+  }
+  if (tx.type === "transfer" && tx.to_account_id) {
+    const credit = amount * (Number(tx.exchange_rate) || 1) - (Number(tx.transfer_charge) || 0);
+    try {
+      await updateBalance(tx.to_account_id, -credit);
+    } catch (e) {
+      try { await updateBalance(tx.account_id, -amount * sign); } catch (e2) { console.error("undo failed", e2); }
+      await restore();
+      throw e;
+    }
+  }
+  return true;
+}
+
+async function onMenu(chatId: number, messageId: number, data: string) {
+  if (data === "m") return show(chatId, MENU_TEXT, MENU_ROWS, messageId);
+  if (data === "m:tr") return startEntry(chatId, "transfer", messageId);
+
+  try {
+    if (data === "m:bal") return await show(chatId, await reportBalances(), BACK, messageId);
+    if (data === "m:rec") return await show(chatId, await reportRecent(), BACK, messageId);
+    if (data === "m:dr") return await show(chatId, await reportDrafts(), BACK, messageId);
+
+    const today = await todayForUser();
+    if (data === "m:day") {
+      return await show(chatId, await reportSummary(`📊 <b>Today</b> (${shortDate(today)})`, today, today), BACK, messageId);
+    }
+    if (data === "m:mon") {
+      const title = `📅 <b>This month</b> (1 – ${shortDate(today)})`;
+      return await show(chatId, await reportSummary(title, `${today.slice(0, 7)}-01`, today), BACK, messageId);
+    }
+    if (data === "m:bud") return await show(chatId, await reportBudgets(today), BACK, messageId);
+
+    if (data === "m:undo") {
+      const tx = await lastTransaction();
+      if (!tx) return await show(chatId, "↩️ <b>Undo last</b>\n\nගනුදෙනු නැහැ.", BACK, messageId);
+      const line = txLine(tx, await accountNames());
+      if (tx.debt_id || tx.investment_id) {
+        return await show(
+          chatId,
+          `↩️ <b>Undo last</b>\n\n${line}\n\nමේක debt/investment එකකට සම්බන්ධයි, ඒ නිසා මෙතනින් undo කරන්න බැහැ. App එකෙන් කරන්න.`,
+          BACK,
+          messageId,
+        );
+      }
+      return await show(
+        chatId,
+        `↩️ <b>Undo last</b>\n\n${line}\n\nමේ transaction එක delete කරලා balance එක ආපහු හදන්නද?`,
+        [[{ text: "🗑 Delete කරන්න", callback_data: `u:${String(tx.id).slice(0, 8)}` }], ...BACK],
+        messageId,
+      );
+    }
+
+    if (data.startsWith("u:")) {
+      const tx = await lastTransaction();
+      // Only ever undo the one that was shown; if something newer exists, stop.
+      if (!tx || !String(tx.id).startsWith(data.slice(2)) || tx.debt_id || tx.investment_id) {
+        return await show(chatId, "↩️ ඒ transaction එක දැන් අන්තිම එක නෙවෙයි, නැත්නම් දැනටමත් delete වෙලා. කිසිම දෙයක් වෙනස් කළේ නැහැ.", BACK, messageId);
+      }
+      const line = txLine(tx, await accountNames());
+      const done = await undoTransaction(tx);
+      return await show(
+        chatId,
+        done ? `✅ <b>Delete උනා</b>, balance එක ආපහු හැදුවා.\n\n${line}` : "↩️ ඒක දැනටමත් delete වෙලා.",
+        BACK,
+        messageId,
+      );
+    }
+  } catch (e) {
+    console.error("menu", data, e);
+    await show(chatId, "⚠️ ඒක කරන්න බැරි උනා. ආයෙ උත්සාහ කරන්න.", BACK, messageId);
+  }
+}
+
 // ---------- update handling ----------
 
 const WELCOME =
-  "👋 <b>WealthFlow bot</b>\n\nයට තියෙන බොත්තම් තුනෙන් එකක් තෝරන්න: " +
-  "Expense, Income, Transfer.\nඊට පස්සේ බොත්තම් වලින්ම ඉස්සරහට යන්න.";
+  "👋 <b>WealthFlow bot</b>\n\nයට තියෙන බොත්තම් වලින් පටන් ගන්න: " +
+  "Expense, Income.\nTransfer, balances, reports, budgets, undo වගේ ඒවා <b>Menu</b> එකේ.";
 
-async function startEntry(chatId: number, type: TxType) {
+async function startEntry(chatId: number, type: TxType, messageId?: number) {
   const accounts = await loadAccounts();
   if (accounts.length === 0) {
     await sendMenu(chatId, "WealthFlow එකේ තවම wallet එකක් නැහැ. මුලින් app එකේ Accounts වල එකක් හදන්න.");
@@ -445,7 +710,7 @@ async function startEntry(chatId: number, type: TxType) {
   settle(st, accounts);
   await saveSession(chatId, st);
   const v = view(st, accounts, cats);
-  await show(chatId, v.text, v.rows);
+  await show(chatId, v.text, v.rows, messageId);
 }
 
 async function onText(chatId: number, text: string) {
@@ -465,11 +730,12 @@ async function onText(chatId: number, text: string) {
   if (t === BTN_EXPENSE || cmd === "/expense") return startEntry(chatId, "expense");
   if (t === BTN_INCOME || cmd === "/income") return startEntry(chatId, "income");
   if (t === BTN_TRANSFER || cmd === "/transfer") return startEntry(chatId, "transfer");
+  if (t === BTN_MENU || cmd === "/menu") return show(chatId, MENU_TEXT, MENU_ROWS);
 
   // Otherwise the text is an answer to "type the amount" / "type a note".
   const st = await loadSession(chatId);
   if (!st || !["amount", "received", "note", "newcat_name"].includes(st.step)) {
-    await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Transfer.");
+    await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Menu.");
     return;
   }
 
@@ -522,6 +788,11 @@ async function onCallback(chatId: number, messageId: number, data: string) {
   if (data === "x") {
     await clearSession(chatId);
     await tg("editMessageText", { chat_id: chatId, message_id: messageId, text: "❌ අත්හැරියා." });
+    return;
+  }
+  // Menu screens and undo do not belong to an entry in progress.
+  if (data === "m" || data.startsWith("m:") || data.startsWith("u:")) {
+    await onMenu(chatId, messageId, data);
     return;
   }
 
