@@ -4,6 +4,8 @@
 //   Expense · Income · Transfer
 // Tap one, then keep tapping: wallet -> (destination wallet | category) ->
 // type the amount -> optional note -> Save.
+// The category screen lists every category and subcategory at once, and
+// "New category" adds one (main or under an existing one) without leaving the chat.
 //
 // On Save the bot creates the transaction and updates the wallet balance(s)
 // in the same order the app does (insert row, then update_account_balance).
@@ -34,12 +36,14 @@ type Account = { id: string; name: string; currency: string; type: string };
 type Category = { id: string; name: string; parent_id: string | null; kind: string };
 
 type State = {
-  step: "wallet" | "to" | "category" | "sub" | "amount" | "received" | "note" | "confirm";
+  step:
+    | "wallet" | "to" | "category" | "newcat_where" | "newcat_name"
+    | "amount" | "received" | "note" | "confirm";
   type: TxType;
   accountId?: string;
   toAccountId?: string; // transfer only
   category?: string;
-  parentId?: string; // while choosing a subcategory
+  newParentId?: string; // while adding a category: "" = main, else the parent's id
   amount?: number;
   received?: number; // transfer between different currencies
   description?: string;
@@ -202,7 +206,8 @@ function settle(st: State, accounts: Account[]) {
       else { st.step = "to"; return; }
     }
   } else if (!st.category) {
-    st.step = st.parentId ? "sub" : "category";
+    // Stay on the "add a category" screens while they are in progress.
+    if (st.step !== "newcat_where" && st.step !== "newcat_name") st.step = "category";
     return;
   }
 
@@ -261,25 +266,44 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
     const kind = st.type;
     const parents = cats.filter((c) => !c.parent_id && (c.kind === kind || c.kind === "both"));
     const other = kind === "income" ? "Other Income" : "Other";
-    const buttons: Button[] = parents.length
-      ? parents.map((c) => ({ text: c.name, callback_data: `k:${c.id.slice(0, 8)}` }))
-      : (kind === "income" ? FALLBACK_INCOME : FALLBACK_EXPENSE).map((n) => ({
-          text: n, callback_data: `f:${n}`,
-        }));
-    if (!parents.some((c) => c.name === other)) buttons.push({ text: other, callback_data: `f:${other}` });
-    return { text: `${head}\n\nCategory එක තෝරන්න:`, rows: [...chunk(buttons, 2), [cancel]] };
+    const rows: Button[][] = [];
+    // Every category on one screen: the main one on its own row, its
+    // subcategories underneath in pairs.
+    for (const p of parents) {
+      rows.push([{ text: `📁 ${p.name}`, callback_data: `k:${p.id.slice(0, 8)}` }]);
+      const kids = cats.filter((c) => c.parent_id === p.id);
+      rows.push(...chunk(kids.map((c) => ({ text: c.name, callback_data: `s:${c.id.slice(0, 8)}` })), 2));
+    }
+    if (!parents.length) {
+      rows.push(...chunk(
+        (kind === "income" ? FALLBACK_INCOME : FALLBACK_EXPENSE).map((n) => ({ text: n, callback_data: `f:${n}` })),
+        2,
+      ));
+    }
+    if (!parents.some((c) => c.name === other)) rows.push([{ text: other, callback_data: `f:${other}` }]);
+    rows.push([{ text: "➕ New category", callback_data: "nc" }]);
+    return { text: `${head}\n\nCategory එක තෝරන්න:`, rows: [...rows, [cancel]] };
   }
 
-  if (st.step === "sub") {
-    const parent = cats.find((c) => c.id === st.parentId);
-    const kids = cats.filter((c) => c.parent_id === st.parentId);
+  if (st.step === "newcat_where") {
+    const kind = st.type;
+    const parents = cats.filter((c) => !c.parent_id && (c.kind === kind || c.kind === "both"));
     return {
-      text: `${head}\n\n<b>${esc(parent?.name ?? "")}</b> — sub-category එක තෝරන්න:`,
+      text: `${head}\n\n➕ අලුත් category එක කොතනටද එකතු කරන්නේ?`,
       rows: [
-        [{ text: `${parent?.name ?? ""} (General)`, callback_data: "g" }],
-        ...chunk(kids.map((c) => ({ text: c.name, callback_data: `s:${c.id.slice(0, 8)}` })), 2),
+        [{ text: "🆕 Main category එකක් විදියට", callback_data: "np:" }],
+        ...chunk(parents.map((p) => ({ text: `📁 ${p.name} යටතට`, callback_data: `np:${p.id.slice(0, 8)}` })), 2),
         [{ text: "↩️ Back", callback_data: "bk" }, cancel],
       ],
+    };
+  }
+
+  if (st.step === "newcat_name") {
+    const parent = cats.find((c) => c.id === st.newParentId);
+    const where = parent ? `<b>${esc(parent.name)}</b> යටතට` : "main category එකක් විදියට";
+    return {
+      text: `${head}\n\n✏️ අලුත් category එකේ නම type කරලා එවන්න (${where}).`,
+      rows: [[{ text: "↩️ Back", callback_data: "bk" }, cancel]],
     };
   }
 
@@ -310,6 +334,34 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
     text: `${head}\n\nSave කරන්නද?`,
     rows: [[{ text: "✅ Save", callback_data: "ok" }], [cancel]],
   };
+}
+
+/**
+ * Add a category (or reuse one with the same name in the same place) and
+ * return the value transactions store: "Parent" or "Parent > Child".
+ */
+async function addCategory(st: State, rawName: string, cats: Category[]): Promise<string> {
+  const name = rawName.replace(/\s+/g, " ").trim().slice(0, 40);
+  const parent = st.newParentId ? cats.find((c) => c.id === st.newParentId) : undefined;
+  if (st.newParentId && !parent) throw new Error("parent category not found");
+  const parentId = parent?.id ?? null;
+
+  const existing = cats.find(
+    (c) => (c.parent_id ?? null) === parentId && c.name.toLowerCase() === name.toLowerCase(),
+  );
+  const finalName = existing?.name ?? name;
+  if (!existing) {
+    const { error } = await admin.from("categories").insert({
+      user_id: USER_ID,
+      name,
+      parent_id: parentId,
+      icon: "Tag",
+      color: "primary",
+      kind: parent ? parent.kind : st.type,
+    });
+    if (error) throw error;
+  }
+  return parent ? `${parent.name} > ${finalName}` : finalName;
 }
 
 /**
@@ -416,13 +468,36 @@ async function onText(chatId: number, text: string) {
 
   // Otherwise the text is an answer to "type the amount" / "type a note".
   const st = await loadSession(chatId);
-  if (!st || !["amount", "received", "note"].includes(st.step)) {
+  if (!st || !["amount", "received", "note", "newcat_name"].includes(st.step)) {
     await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Transfer.");
     return;
   }
 
+  const cats = st.type === "transfer" ? [] : await loadCategories();
+
   if (st.step === "note") {
     st.description = t.slice(0, 200);
+  } else if (st.step === "newcat_name") {
+    const name = t.replace(/\s+/g, " ").trim();
+    if (!name || name.startsWith("/") || name.includes(">")) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: "ඒ නම පාවිච්චි කරන්න බැහැ. '>' හෝ '/' නැති කෙටි නමක් එවන්න, උදා: Fuel",
+      });
+      return;
+    }
+    try {
+      st.category = await addCategory(st, name, cats);
+      delete st.newParentId;
+      st.step = "category";
+    } catch (e) {
+      console.error("addCategory", e);
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Category එක හදන්න බැරි උනා. ආයෙ නම එවන්න, නැත්නම් Back එබුවා.",
+      });
+      return;
+    }
   } else {
     const n = parseAmount(t);
     if (n == null) {
@@ -439,7 +514,7 @@ async function onText(chatId: number, text: string) {
   const accounts = await loadAccounts();
   settle(st, accounts);
   await saveSession(chatId, st);
-  const v = view(st, accounts, []);
+  const v = view(st, accounts, cats);
   await show(chatId, v.text, v.rows);
 }
 
@@ -498,21 +573,26 @@ async function onCallback(chatId: number, messageId: number, data: string) {
     if (acc) st.toAccountId = acc.id;
   } else if (data.startsWith("k:") && st.step === "category") {
     const parent = cats.find((c) => !c.parent_id && c.id.startsWith(data.slice(2)));
-    if (parent) {
-      if (cats.some((c) => c.parent_id === parent.id)) st.parentId = parent.id;
-      else st.category = parent.name;
-    }
+    if (parent) st.category = parent.name;
+  } else if (data.startsWith("s:") && st.step === "category") {
+    const child = cats.find((c) => c.parent_id && c.id.startsWith(data.slice(2)));
+    const parent = child ? cats.find((c) => c.id === child.parent_id) : undefined;
+    if (child && parent) st.category = `${parent.name} > ${child.name}`;
   } else if (data.startsWith("f:") && st.step === "category") {
     st.category = data.slice(2);
-  } else if (data.startsWith("s:") && st.step === "sub") {
-    const child = cats.find((c) => c.parent_id === st.parentId && c.id.startsWith(data.slice(2)));
-    const parent = cats.find((c) => c.id === st.parentId);
-    if (child && parent) { st.category = `${parent.name} > ${child.name}`; delete st.parentId; }
-  } else if (data === "g" && st.step === "sub") {
-    const parent = cats.find((c) => c.id === st.parentId);
-    if (parent) { st.category = parent.name; delete st.parentId; }
-  } else if (data === "bk" && st.step === "sub") {
-    delete st.parentId;
+  } else if (data === "nc" && st.step === "category") {
+    st.step = "newcat_where";
+  } else if (data.startsWith("np:") && st.step === "newcat_where") {
+    const p = data.slice(3);
+    const parent = p ? cats.find((c) => !c.parent_id && c.id.startsWith(p)) : undefined;
+    if (p && !parent) return;
+    st.newParentId = parent?.id ?? "";
+    st.step = "newcat_name";
+  } else if (data === "bk" && st.step === "newcat_where") {
+    st.step = "category";
+  } else if (data === "bk" && st.step === "newcat_name") {
+    delete st.newParentId;
+    st.step = "newcat_where";
   } else if (data === "n" && st.step === "note") {
     st.description = "";
   } else {
