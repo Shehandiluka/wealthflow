@@ -2,8 +2,8 @@
 //
 // Button-driven entry. The chat always shows three buttons:
 //   Expense · Income · Menu
-// Menu holds everything else: Transfer, Balances, Recent, Today, This month,
-// Budgets, Drafts and Undo last.
+// Menu holds everything else: Transfer, Pay Later, Balances, Recent, Today,
+// This month, Budgets, Drafts and Undo last.
 // Tap one, then keep tapping: wallet -> (destination wallet | category) ->
 // type the amount -> optional note -> Save.
 // The category screen lists every category and subcategory at once, and
@@ -40,8 +40,10 @@ type Category = { id: string; name: string; parent_id: string | null; kind: stri
 type State = {
   step:
     | "wallet" | "to" | "category" | "newcat_where" | "newcat_name"
-    | "amount" | "received" | "note" | "confirm";
-  type: TxType;
+    | "amount" | "received" | "note" | "confirm"
+    | "pl_name" | "pl_cur" | "pl_wallet";
+  // A transaction, or one of the Pay Later actions (new tab / purchase / payment).
+  type: TxType | "pl_new" | "pl_buy" | "pl_pay";
   accountId?: string;
   toAccountId?: string; // transfer only
   category?: string;
@@ -49,6 +51,12 @@ type State = {
   amount?: number;
   received?: number; // transfer between different currencies
   description?: string;
+  // Pay Later
+  tabId?: string;
+  plName?: string; // the tab's person / store
+  currency?: string; // the tab's currency
+  remaining?: number; // what is still owed on the tab (payment only)
+  noWallet?: boolean; // payment recorded without touching a wallet
 };
 
 type Button = { text: string; callback_data: string };
@@ -115,8 +123,16 @@ function parseAmount(text: string): number | null {
   return isFinite(n) && n > 0 ? n : null;
 }
 
-const typeLabel = (t: TxType) =>
-  t === "income" ? BTN_INCOME : t === "transfer" ? BTN_TRANSFER : BTN_EXPENSE;
+const BTN_PAYLATER = "🛒 Pay Later";
+const typeLabel = (t: State["type"]) =>
+  t === "income" ? BTN_INCOME
+    : t === "transfer" ? BTN_TRANSFER
+    : t === "pl_new" ? `${BTN_PAYLATER} · New tab`
+    : t === "pl_buy" ? `${BTN_PAYLATER} · Purchase`
+    : t === "pl_pay" ? `${BTN_PAYLATER} · Payment`
+    : BTN_EXPENSE;
+/** Categories offered for this entry: income ones for Income, expense ones otherwise. */
+const kindOf = (st: State) => (st.type === "income" ? "income" : "expense");
 const money = (n: number, c?: string) =>
   `${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}${c ? " " + c : ""}`;
 
@@ -197,6 +213,33 @@ const FALLBACK_INCOME = ["Salary", "Freelance", "Gifts Received", "Refunds"];
 
 /** Decide which question comes next. Steps with a single possible answer are filled in. */
 function settle(st: State, accounts: Account[]) {
+  const keepNewCat = st.step === "newcat_where" || st.step === "newcat_name";
+
+  if (st.type === "pl_new") {
+    if (!st.plName) { st.step = "pl_name"; return; }
+    if (!st.currency) {
+      const currencies = [...new Set(accounts.map((a) => a.currency))];
+      if (currencies.length === 1) st.currency = currencies[0];
+      else { st.step = "pl_cur"; return; }
+    }
+    st.step = "confirm";
+    return;
+  }
+  if (st.type === "pl_buy") {
+    if (!st.category) { if (!keepNewCat) st.step = "category"; return; }
+    if (st.amount == null) { st.step = "amount"; return; }
+    if (st.description == null) { st.step = "note"; return; }
+    st.step = "confirm";
+    return;
+  }
+  if (st.type === "pl_pay") {
+    if (st.amount == null) { st.step = "amount"; return; }
+    if (!st.accountId && !st.noWallet) { st.step = "pl_wallet"; return; }
+    if (st.description == null) { st.step = "note"; return; }
+    st.step = "confirm";
+    return;
+  }
+
   if (!st.accountId) {
     if (accounts.length === 1 && st.type !== "transfer") st.accountId = accounts[0].id;
     else { st.step = "wallet"; return; }
@@ -210,7 +253,7 @@ function settle(st: State, accounts: Account[]) {
     }
   } else if (!st.category) {
     // Stay on the "add a category" screens while they are in progress.
-    if (st.step !== "newcat_where" && st.step !== "newcat_name") st.step = "category";
+    if (!keepNewCat) st.step = "category";
     return;
   }
 
@@ -233,10 +276,13 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
 
   // What has been chosen so far, shown above every question.
   const lines = [`<b>${typeLabel(st.type)}</b>`];
+  if (st.plName) lines.push(`Tab: ${esc(st.plName)}${st.currency ? ` (${st.currency})` : ""}`);
+  if (st.type === "pl_pay" && st.remaining != null) lines.push(`Remaining: ${money(st.remaining, st.currency)}`);
   if (from) lines.push(`${st.type === "transfer" ? "From" : "Wallet"}: ${esc(from.name)} (${from.currency})`);
   if (to) lines.push(`To: ${esc(to.name)} (${to.currency})`);
   if (st.category) lines.push(`Category: ${esc(st.category)}`);
-  if (st.amount != null) lines.push(`Amount: <b>${money(st.amount, from?.currency)}</b>`);
+  if (st.amount != null) lines.push(`Amount: <b>${money(st.amount, from?.currency ?? st.currency)}</b>`);
+  if (st.noWallet) lines.push("Wallet: — (record විතරයි)");
   if (st.received != null) lines.push(`Received: <b>${money(st.received, to?.currency)}</b>`);
   if (st.description) lines.push(`Note: ${esc(st.description)}`);
   const head = lines.join("\n");
@@ -266,7 +312,7 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
   }
 
   if (st.step === "category") {
-    const kind = st.type;
+    const kind = kindOf(st);
     const parents = cats.filter((c) => !c.parent_id && (c.kind === kind || c.kind === "both"));
     const other = kind === "income" ? "Other Income" : "Other";
     const rows: Button[][] = [];
@@ -289,7 +335,7 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
   }
 
   if (st.step === "newcat_where") {
-    const kind = st.type;
+    const kind = kindOf(st);
     const parents = cats.filter((c) => !c.parent_id && (c.kind === kind || c.kind === "both"));
     return {
       text: `${head}\n\n➕ අලුත් category එක කොතනටද එකතු කරන්නේ?`,
@@ -310,10 +356,38 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
     };
   }
 
-  if (st.step === "amount") {
+  if (st.step === "pl_name") {
+    return { text: `${head}\n\n✏️ කඩේ හෝ කෙනාගේ නම type කරලා එවන්න.`, rows: [[cancel]] };
+  }
+
+  if (st.step === "pl_cur") {
+    const currencies = [...new Set(accounts.map((a) => a.currency))];
     return {
-      text: `${head}\n\n✏️ මුදල type කරලා එවන්න (${from?.currency ?? ""}). උදා: <code>1500</code>`,
-      rows: [[cancel]],
+      text: `${head}\n\nකරන්සිය තෝරන්න:`,
+      rows: [...chunk(currencies.map((c) => ({ text: c, callback_data: `pc:${c}` })), 3), [cancel]],
+    };
+  }
+
+  if (st.step === "pl_wallet") {
+    const wallets = accounts.filter((a) => a.currency === st.currency);
+    return {
+      text: `${head}\n\nකොයි wallet එකෙන්ද ගෙව්වේ?`,
+      rows: [
+        ...chunk(wallets.map((a) => ({ text: `${a.name} (${a.currency})`, callback_data: `w:${a.id.slice(0, 8)}` })), 2),
+        [{ text: "Wallet නැතුව (record විතරක්)", callback_data: "w:none" }],
+        [cancel],
+      ],
+    };
+  }
+
+  if (st.step === "amount") {
+    const cur = from?.currency ?? st.currency ?? "";
+    const full: Button[][] = st.type === "pl_pay" && (st.remaining ?? 0) > 0
+      ? [[{ text: `සම්පූර්ණ ඉතිරිය: ${money(st.remaining!, cur)}`, callback_data: "pf" }]]
+      : [];
+    return {
+      text: `${head}\n\n✏️ මුදල type කරලා එවන්න (${cur}). උදා: <code>1500</code>`,
+      rows: [...full, [cancel]],
     };
   }
 
@@ -360,7 +434,7 @@ async function addCategory(st: State, rawName: string, cats: Category[]): Promis
       parent_id: parentId,
       icon: "Tag",
       color: "primary",
-      kind: parent ? parent.kind : st.type,
+      kind: parent ? parent.kind : kindOf(st),
     });
     if (error) throw error;
   }
@@ -430,7 +504,7 @@ async function postTransaction(st: State, accounts: Account[]): Promise<void> {
 // ---------- menu: reports and undo ----------
 
 const MENU_ROWS: Button[][] = [
-  [{ text: BTN_TRANSFER, callback_data: "m:tr" }],
+  [{ text: BTN_TRANSFER, callback_data: "m:tr" }, { text: BTN_PAYLATER, callback_data: "m:pl" }],
   [{ text: "💼 Balances", callback_data: "m:bal" }, { text: "🧾 Recent", callback_data: "m:rec" }],
   [{ text: "📊 Today", callback_data: "m:day" }, { text: "📅 This month", callback_data: "m:mon" }],
   [{ text: "🎯 Budgets", callback_data: "m:bud" }, { text: "📥 Drafts", callback_data: "m:dr" }],
@@ -629,11 +703,223 @@ async function undoTransaction(tx: Tx): Promise<boolean> {
   return true;
 }
 
+// ---------- Pay Later ----------
+
+type Tab = { id: string; person_or_store: string; currency: string; amount: number; is_paid: boolean; due_date: string | null };
+
+const sumAmounts = (rows: Tx[] | null) => round2((rows ?? []).reduce((n, r) => n + Number(r.amount), 0));
+
+async function loadTabs(onlyUnpaid: boolean): Promise<Tab[]> {
+  let q = admin
+    .from("pay_later")
+    .select("id, person_or_store, currency, amount, is_paid, due_date, created_at")
+    .eq("user_id", USER_ID);
+  if (onlyUnpaid) q = q.eq("is_paid", false);
+  const { data, error } = await q.order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as Tab[];
+}
+
+async function findTab(prefix: string): Promise<Tab | null> {
+  return (await loadTabs(false)).find((t) => t.id.startsWith(prefix)) ?? null;
+}
+
+async function tabPaid(tabId: string): Promise<number> {
+  const { data, error } = await admin.from("pay_later_payments").select("amount").eq("pay_later_id", tabId);
+  if (error) throw error;
+  return sumAmounts(data as Tx[]);
+}
+
+const PL_BACK: Button[][] = [[{ text: BTN_PAYLATER, callback_data: "m:pl" }, { text: BTN_MENU, callback_data: "m" }]];
+
+async function payLaterList(): Promise<{ text: string; rows: Button[][] }> {
+  const tabs = await loadTabs(true);
+  const rows: Button[][] = [];
+  const totals = new Map<string, number>();
+  for (const t of tabs) {
+    const remaining = Math.max(0, round2(Number(t.amount) - (await tabPaid(t.id))));
+    totals.set(t.currency, (totals.get(t.currency) ?? 0) + remaining);
+    rows.push([{ text: `${t.person_or_store} — ${money(remaining, t.currency)}`, callback_data: `pl:${t.id.slice(0, 8)}` }]);
+  }
+  rows.push([{ text: "➕ New tab", callback_data: "pl:new" }], ...BACK);
+  const totalLines = [...totals].map(([c, n]) => `ගෙවන්න තියෙන මුළු ගණන ${c}: <b>${money(round2(n), c)}</b>`);
+  const body = tabs.length
+    ? `${totalLines.join("\n")}\n\nTab එකක් තෝරන්න:`
+    : "ගෙවන්න තියෙන tab එකක්වත් නැහැ ✅";
+  return { text: `<b>${BTN_PAYLATER}</b>\n\n${body}`, rows };
+}
+
+async function payLaterTab(tab: Tab): Promise<{ text: string; rows: Button[][] }> {
+  const paid = await tabPaid(tab.id);
+  const total = round2(Number(tab.amount));
+  const remaining = Math.max(0, round2(total - paid));
+  const { data: items, error } = await admin
+    .from("pay_later_items")
+    .select("description, amount, category, purchased_at, created_at")
+    .eq("pay_later_id", tab.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  if (error) throw error;
+  const itemLines = ((items ?? []) as Tx[]).map((i) =>
+    `${shortDate(i.purchased_at)} · ${money(Number(i.amount))} · ${esc(i.category)}` +
+    (i.description ? ` — ${esc(String(i.description).slice(0, 40))}` : ""));
+  const id8 = tab.id.slice(0, 8);
+  const actions: Button[] = [{ text: "➕ Purchase", callback_data: `pp:${id8}` }];
+  if (remaining > 0) actions.push({ text: "💵 Pay", callback_data: `py:${id8}` });
+  return {
+    text:
+      `🛒 <b>${esc(tab.person_or_store)}</b>${tab.is_paid ? " (settled)" : ""}\n\n` +
+      `Total: ${money(total, tab.currency)}\nPaid: ${money(paid, tab.currency)}\n` +
+      `Remaining: <b>${money(remaining, tab.currency)}</b>` +
+      (tab.due_date ? `\nDue: ${shortDate(tab.due_date)}` : "") +
+      (itemLines.length ? `\n\nඅන්තිම purchases:\n${itemLines.join("\n")}` : "\n\nතවම purchases නැහැ."),
+    rows: [actions, ...PL_BACK],
+  };
+}
+
+async function createTab(st: State): Promise<Tab> {
+  const { data, error } = await admin
+    .from("pay_later")
+    .insert({ user_id: USER_ID, person_or_store: st.plName, currency: st.currency, amount: 0, description: "" })
+    .select("id, person_or_store, currency, amount, is_paid, due_date")
+    .single();
+  if (error || !data) throw error ?? new Error("insert failed");
+  return data as Tab;
+}
+
+/** Add a purchase to a tab and refresh the tab total — no wallet is touched, same as the app. */
+async function addPurchase(st: State): Promise<void> {
+  if (!st.tabId || st.amount == null) throw new Error("incomplete purchase");
+  const { error } = await admin.from("pay_later_items").insert({
+    pay_later_id: st.tabId,
+    user_id: USER_ID,
+    description: st.description ?? "",
+    amount: round2(st.amount),
+    category: st.category ?? "Other",
+    purchased_at: await todayForUser(),
+  });
+  if (error) throw error;
+  const { data: items, error: e2 } = await admin.from("pay_later_items").select("amount").eq("pay_later_id", st.tabId);
+  if (e2) throw e2;
+  const { error: e3 } = await admin.from("pay_later").update({ amount: sumAmounts(items as Tx[]) }).eq("id", st.tabId);
+  if (e3) throw e3;
+}
+
+/**
+ * Record a payment on a tab — the app's rules: when a wallet is chosen the
+ * payment becomes one expense per category it pays off (oldest purchases
+ * first), the wallet is debited once for the whole payment, and the tab is
+ * marked settled when payments cover its total. Anything written before a
+ * failure is removed again.
+ */
+async function addPayment(st: State): Promise<void> {
+  if (!st.tabId || st.amount == null) throw new Error("incomplete payment");
+  const amount = round2(st.amount);
+  const today = await todayForUser();
+  const paidBefore = await tabPaid(st.tabId);
+
+  const { data: pay, error } = await admin
+    .from("pay_later_payments")
+    .insert({ pay_later_id: st.tabId, user_id: USER_ID, amount, note: st.description ?? "", paid_at: today })
+    .select("id")
+    .single();
+  if (error || !pay) throw error ?? new Error("insert failed");
+
+  if (st.accountId) {
+    const txIds: string[] = [];
+    try {
+      const { data: items, error: e1 } = await admin
+        .from("pay_later_items")
+        .select("amount, category, created_at")
+        .eq("pay_later_id", st.tabId)
+        .order("created_at", { ascending: true });
+      if (e1) throw e1;
+
+      const rangeStart = paidBefore;
+      const rangeEnd = paidBefore + amount;
+      const byCategory = new Map<string, number>();
+      let cursor = 0;
+      for (const item of (items ?? []) as Tx[]) {
+        const itemStart = cursor;
+        const itemEnd = cursor + Number(item.amount);
+        cursor = itemEnd;
+        const overlap = Math.min(itemEnd, rangeEnd) - Math.max(itemStart, rangeStart);
+        if (overlap > 0) byCategory.set(item.category, (byCategory.get(item.category) ?? 0) + overlap);
+      }
+      const allocated = [...byCategory.values()].reduce((n, v) => n + v, 0);
+      if (amount - allocated > 0.004) {
+        byCategory.set("Pay Later", (byCategory.get("Pay Later") ?? 0) + (amount - allocated));
+      }
+
+      const description = `Pay Later: ${st.plName ?? ""}${st.description ? ` - ${st.description}` : ""}`;
+      for (const [category, part] of byCategory) {
+        if (part <= 0) continue;
+        const { data: tx, error: e2 } = await admin
+          .from("transactions")
+          .insert({
+            user_id: USER_ID,
+            account_id: st.accountId,
+            type: "expense",
+            amount: round2(part),
+            currency: st.currency ?? "LKR",
+            category,
+            description,
+            date: today,
+          })
+          .select("id")
+          .single();
+        if (e2 || !tx) throw e2 ?? new Error("insert failed");
+        txIds.push(tx.id as string);
+      }
+      await updateBalance(st.accountId, -amount);
+    } catch (e) {
+      for (const id of txIds) await admin.from("transactions").delete().eq("id", id);
+      await admin.from("pay_later_payments").delete().eq("id", pay.id);
+      throw e;
+    }
+  }
+
+  const { data: tab } = await admin.from("pay_later").select("amount").eq("id", st.tabId).maybeSingle();
+  const total = Number(tab?.amount ?? 0);
+  if (total > 0 && (await tabPaid(st.tabId)) >= total) {
+    await admin.from("pay_later").update({ is_paid: true, paid_at: new Date().toISOString() }).eq("id", st.tabId);
+  }
+}
+
+async function startPayLater(chatId: number, messageId: number, type: "pl_new" | "pl_buy" | "pl_pay", tab?: Tab) {
+  const accounts = await loadAccounts();
+  const st: State = { step: "pl_name", type };
+  if (tab) {
+    st.tabId = tab.id;
+    st.plName = tab.person_or_store;
+    st.currency = tab.currency;
+    if (type === "pl_pay") st.remaining = Math.max(0, round2(Number(tab.amount) - (await tabPaid(tab.id))));
+  }
+  const cats = type === "pl_buy" ? await loadCategories() : [];
+  settle(st, accounts);
+  await saveSession(chatId, st);
+  const v = view(st, accounts, cats);
+  await show(chatId, v.text, v.rows, messageId);
+}
+
 async function onMenu(chatId: number, messageId: number, data: string) {
   if (data === "m") return show(chatId, MENU_TEXT, MENU_ROWS, messageId);
   if (data === "m:tr") return startEntry(chatId, "transfer", messageId);
 
   try {
+    if (data === "m:pl") {
+      const v = await payLaterList();
+      return await show(chatId, v.text, v.rows, messageId);
+    }
+    if (data === "pl:new") return await startPayLater(chatId, messageId, "pl_new");
+    if (data.startsWith("pl:") || data.startsWith("pp:") || data.startsWith("py:")) {
+      const tab = await findTab(data.slice(3));
+      if (!tab) return await show(chatId, "ඒ tab එක හොයාගන්න බැරි උනා.", PL_BACK, messageId);
+      if (data.startsWith("pp:")) return await startPayLater(chatId, messageId, "pl_buy", tab);
+      if (data.startsWith("py:")) return await startPayLater(chatId, messageId, "pl_pay", tab);
+      const v = await payLaterTab(tab);
+      return await show(chatId, v.text, v.rows, messageId);
+    }
     if (data === "m:bal") return await show(chatId, await reportBalances(), BACK, messageId);
     if (data === "m:rec") return await show(chatId, await reportRecent(), BACK, messageId);
     if (data === "m:dr") return await show(chatId, await reportDrafts(), BACK, messageId);
@@ -652,6 +938,14 @@ async function onMenu(chatId: number, messageId: number, data: string) {
       const tx = await lastTransaction();
       if (!tx) return await show(chatId, "↩️ <b>Undo last</b>\n\nගනුදෙනු නැහැ.", BACK, messageId);
       const line = txLine(tx, await accountNames());
+      if (String(tx.description ?? "").startsWith("Pay Later")) {
+        return await show(
+          chatId,
+          `↩️ <b>Undo last</b>\n\n${line}\n\nමේක Pay Later payment එකක කොටසක්. App එකේ Pay Later එකෙන් ඒ payment එක delete කරන්න.`,
+          BACK,
+          messageId,
+        );
+      }
       if (tx.debt_id || tx.investment_id) {
         return await show(
           chatId,
@@ -671,7 +965,10 @@ async function onMenu(chatId: number, messageId: number, data: string) {
     if (data.startsWith("u:")) {
       const tx = await lastTransaction();
       // Only ever undo the one that was shown; if something newer exists, stop.
-      if (!tx || !String(tx.id).startsWith(data.slice(2)) || tx.debt_id || tx.investment_id) {
+      if (
+        !tx || !String(tx.id).startsWith(data.slice(2)) || tx.debt_id || tx.investment_id ||
+        String(tx.description ?? "").startsWith("Pay Later")
+      ) {
         return await show(chatId, "↩️ ඒ transaction එක දැන් අන්තිම එක නෙවෙයි, නැත්නම් දැනටමත් delete වෙලා. කිසිම දෙයක් වෙනස් කළේ නැහැ.", BACK, messageId);
       }
       const line = txLine(tx, await accountNames());
@@ -734,7 +1031,7 @@ async function onText(chatId: number, text: string) {
 
   // Otherwise the text is an answer to "type the amount" / "type a note".
   const st = await loadSession(chatId);
-  if (!st || !["amount", "received", "note", "newcat_name"].includes(st.step)) {
+  if (!st || !["amount", "received", "note", "newcat_name", "pl_name"].includes(st.step)) {
     await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Menu.");
     return;
   }
@@ -743,6 +1040,9 @@ async function onText(chatId: number, text: string) {
 
   if (st.step === "note") {
     st.description = t.slice(0, 200);
+  } else if (st.step === "pl_name") {
+    if (t.startsWith("/")) return;
+    st.plName = t.replace(/\s+/g, " ").slice(0, 60);
   } else if (st.step === "newcat_name") {
     const name = t.replace(/\s+/g, " ").trim();
     if (!name || name.startsWith("/") || name.includes(">")) {
@@ -773,6 +1073,13 @@ async function onText(chatId: number, text: string) {
       });
       return;
     }
+    if (st.type === "pl_pay" && st.remaining != null && n > st.remaining + 0.004) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: `ඒක ඉතිරියට වඩා වැඩියි. ගෙවන්න තියෙන්නේ ${money(st.remaining, st.currency)} විතරයි. ආයෙ මුදල එවන්න.`,
+      });
+      return;
+    }
     if (st.step === "amount") st.amount = n;
     else st.received = n;
   }
@@ -791,7 +1098,10 @@ async function onCallback(chatId: number, messageId: number, data: string) {
     return;
   }
   // Menu screens and undo do not belong to an entry in progress.
-  if (data === "m" || data.startsWith("m:") || data.startsWith("u:")) {
+  if (
+    data === "m" || data.startsWith("m:") || data.startsWith("u:") ||
+    data.startsWith("pl:") || data.startsWith("pp:") || data.startsWith("py:")
+  ) {
     await onMenu(chatId, messageId, data);
     return;
   }
@@ -815,7 +1125,10 @@ async function onCallback(chatId: number, messageId: number, data: string) {
     await clearSession(chatId);
     const summary = view({ ...st, step: "confirm" }, accounts, cats).text.replace(/\n\nSave කරන්නද\?$/, "");
     try {
-      await postTransaction(st, accounts);
+      if (st.type === "pl_new") st.tabId = (await createTab(st)).id;
+      else if (st.type === "pl_buy") await addPurchase(st);
+      else if (st.type === "pl_pay") await addPayment(st);
+      else await postTransaction(st, accounts);
     } catch (e) {
       console.error("postTransaction", e);
       await tg("editMessageText", {
@@ -823,6 +1136,16 @@ async function onCallback(chatId: number, messageId: number, data: string) {
         message_id: messageId,
         text: "⚠️ Save කරන්න බැරි උනා, කිසිම දෙයක් වෙනස් වෙලා නැහැ. ආයෙ උත්සාහ කරන්න.",
       });
+      return;
+    }
+    if (st.tabId) {
+      // Pay Later: offer a way straight back to the tab.
+      await show(
+        chatId,
+        `✅ <b>Save උනා</b>\n\n${summary}`,
+        [[{ text: "🛒 Tab එක බලන්න", callback_data: `pl:${st.tabId.slice(0, 8)}` }], ...PL_BACK],
+        messageId,
+      );
       return;
     }
     await tg("editMessageText", {
@@ -864,6 +1187,18 @@ async function onCallback(chatId: number, messageId: number, data: string) {
   } else if (data === "bk" && st.step === "newcat_name") {
     delete st.newParentId;
     st.step = "newcat_where";
+  } else if (data.startsWith("pc:") && st.step === "pl_cur") {
+    const cur = data.slice(3);
+    if (!accounts.some((a) => a.currency === cur)) return;
+    st.currency = cur;
+  } else if (data === "pf" && st.step === "amount" && st.type === "pl_pay" && (st.remaining ?? 0) > 0) {
+    st.amount = st.remaining;
+  } else if (data === "w:none" && st.step === "pl_wallet") {
+    st.noWallet = true;
+  } else if (data.startsWith("w:") && st.step === "pl_wallet") {
+    const acc = accounts.find((a) => a.id.startsWith(data.slice(2)) && a.currency === st.currency);
+    if (!acc) return;
+    st.accountId = acc.id;
   } else if (data === "n" && st.step === "note") {
     st.description = "";
   } else {
