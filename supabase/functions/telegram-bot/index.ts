@@ -2,8 +2,8 @@
 //
 // Button-driven entry. The chat always shows three buttons:
 //   Expense · Income · Menu
-// Menu holds everything else: Transfer, Pay Later, Balances, Recent, Today,
-// This month, Budgets, Drafts and Undo last.
+// Menu holds everything else: Transfer, Pay Later, Lend & Borrow, Balances,
+// Recent, Today, This month, Budgets, Drafts and Undo last.
 // Tap one, then keep tapping: wallet -> (destination wallet | category) ->
 // type the amount -> optional note -> Save.
 // The category screen lists every category and subcategory at once, and
@@ -41,9 +41,11 @@ type State = {
   step:
     | "wallet" | "to" | "category" | "newcat_where" | "newcat_name"
     | "amount" | "received" | "note" | "confirm"
-    | "pl_name" | "pl_cur" | "pl_wallet";
-  // A transaction, or one of the Pay Later actions (new tab / purchase / payment).
-  type: TxType | "pl_new" | "pl_buy" | "pl_pay";
+    | "pl_name" | "pl_cur" | "pl_wallet"
+    | "lb_name" | "lb_wallet" | "lb_cur" | "lb_base";
+  // A transaction, a Pay Later action (new tab / purchase / payment),
+  // or a Lend & Borrow action (new person / an entry for a person).
+  type: TxType | "pl_new" | "pl_buy" | "pl_pay" | "lb_new" | "lb_tx";
   accountId?: string;
   toAccountId?: string; // transfer only
   category?: string;
@@ -57,7 +59,16 @@ type State = {
   currency?: string; // the tab's currency
   remaining?: number; // what is still owed on the tab (payment only)
   noWallet?: boolean; // payment recorded without touching a wallet
+  // Lend & Borrow
+  contactId?: string;
+  lbName?: string;
+  lbAction?: LbAction;
+  lbCurrency?: string | null; // the person's balance currency, null for a fresh person
+  lbOwed?: number; // what is outstanding in the direction this repayment settles
+  base?: number; // the amount in the person's currency, when the wallet's differs
 };
+
+type LbAction = "lent" | "borrowed" | "repaid_to_me" | "repaid_by_me";
 
 type Button = { text: string; callback_data: string };
 
@@ -124,12 +135,21 @@ function parseAmount(text: string): number | null {
 }
 
 const BTN_PAYLATER = "🛒 Pay Later";
+const BTN_LEND = "🤝 Lend & Borrow";
+const LB_LABEL: Record<LbAction, string> = {
+  lent: "📤 මම දුන්නා (Lent)",
+  borrowed: "📥 මම ගත්තා (Borrowed)",
+  repaid_to_me: "✅ එයා ආපහු දුන්නා",
+  repaid_by_me: "💵 මම ආපහු දුන්නා",
+};
 const typeLabel = (t: State["type"]) =>
   t === "income" ? BTN_INCOME
     : t === "transfer" ? BTN_TRANSFER
     : t === "pl_new" ? `${BTN_PAYLATER} · New tab`
     : t === "pl_buy" ? `${BTN_PAYLATER} · Purchase`
     : t === "pl_pay" ? `${BTN_PAYLATER} · Payment`
+    : t === "lb_new" ? `${BTN_LEND} · New person`
+    : t === "lb_tx" ? BTN_LEND
     : BTN_EXPENSE;
 /** Categories offered for this entry: income ones for Income, expense ones otherwise. */
 const kindOf = (st: State) => (st.type === "income" ? "income" : "expense");
@@ -232,6 +252,26 @@ function settle(st: State, accounts: Account[]) {
     st.step = "confirm";
     return;
   }
+  if (st.type === "lb_new") {
+    st.step = st.lbName ? "confirm" : "lb_name";
+    return;
+  }
+  if (st.type === "lb_tx") {
+    if (!st.accountId && !st.noWallet) { st.step = "lb_wallet"; return; }
+    if (st.noWallet && !st.currency) {
+      if (st.lbCurrency) st.currency = st.lbCurrency;
+      else {
+        const currencies = [...new Set(accounts.map((a) => a.currency))];
+        if (currencies.length === 1) st.currency = currencies[0];
+        else { st.step = "lb_cur"; return; }
+      }
+    }
+    if (st.amount == null) { st.step = "amount"; return; }
+    if (st.lbCurrency && st.currency !== st.lbCurrency && st.base == null) { st.step = "lb_base"; return; }
+    if (st.description == null) { st.step = "note"; return; }
+    st.step = "confirm";
+    return;
+  }
   if (st.type === "pl_pay") {
     if (st.amount == null) { st.step = "amount"; return; }
     if (!st.accountId && !st.noWallet) { st.step = "pl_wallet"; return; }
@@ -277,12 +317,16 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
   // What has been chosen so far, shown above every question.
   const lines = [`<b>${typeLabel(st.type)}</b>`];
   if (st.plName) lines.push(`Tab: ${esc(st.plName)}${st.currency ? ` (${st.currency})` : ""}`);
+  if (st.lbName) lines.push(`Person: ${esc(st.lbName)}`);
+  if (st.lbAction) lines.push(LB_LABEL[st.lbAction]);
+  if (st.lbOwed) lines.push(`ඉතිරි: ${money(st.lbOwed, st.lbCurrency ?? undefined)}`);
   if (st.type === "pl_pay" && st.remaining != null) lines.push(`Remaining: ${money(st.remaining, st.currency)}`);
   if (from) lines.push(`${st.type === "transfer" ? "From" : "Wallet"}: ${esc(from.name)} (${from.currency})`);
   if (to) lines.push(`To: ${esc(to.name)} (${to.currency})`);
   if (st.category) lines.push(`Category: ${esc(st.category)}`);
   if (st.amount != null) lines.push(`Amount: <b>${money(st.amount, from?.currency ?? st.currency)}</b>`);
   if (st.noWallet) lines.push("Wallet: — (record විතරයි)");
+  if (st.base != null) lines.push(`${st.lbCurrency} වලින්: <b>${money(st.base, st.lbCurrency ?? undefined)}</b>`);
   if (st.received != null) lines.push(`Received: <b>${money(st.received, to?.currency)}</b>`);
   if (st.description) lines.push(`Note: ${esc(st.description)}`);
   const head = lines.join("\n");
@@ -380,10 +424,47 @@ function view(st: State, accounts: Account[], cats: Category[]): { text: string;
     };
   }
 
+  if (st.step === "lb_name") {
+    return { text: `${head}\n\n✏️ කෙනාගේ නම type කරලා එවන්න.`, rows: [[cancel]] };
+  }
+
+  if (st.step === "lb_wallet") {
+    const q = st.lbAction === "lent" || st.lbAction === "repaid_by_me"
+      ? "කොයි wallet එකෙන්ද දුන්නේ?"
+      : "කොයි wallet එකටද ලැබුණේ?";
+    return {
+      text: `${head}\n\n${q}`,
+      rows: [
+        ...walletButtons(accounts, "lw"),
+        [{ text: "Wallet නැතුව (record විතරක්)", callback_data: "lw:none" }],
+        [cancel],
+      ],
+    };
+  }
+
+  if (st.step === "lb_cur") {
+    const currencies = [...new Set(accounts.map((a) => a.currency))];
+    return {
+      text: `${head}\n\nකරන්සිය තෝරන්න:`,
+      rows: [...chunk(currencies.map((c) => ({ text: c, callback_data: `lc:${c}` })), 3), [cancel]],
+    };
+  }
+
+  if (st.step === "lb_base") {
+    return {
+      text:
+        `${head}\n\n✏️ ${esc(st.lbName ?? "")}ගේ ගිණුම තියෙන්නේ ${st.lbCurrency} වලින්. ` +
+        `මේ මුදල ${st.lbCurrency} වලින් කීයද? type කරලා එවන්න.`,
+      rows: [[cancel]],
+    };
+  }
+
   if (st.step === "amount") {
     const cur = from?.currency ?? st.currency ?? "";
     const full: Button[][] = st.type === "pl_pay" && (st.remaining ?? 0) > 0
       ? [[{ text: `සම්පූර්ණ ඉතිරිය: ${money(st.remaining!, cur)}`, callback_data: "pf" }]]
+      : st.type === "lb_tx" && (st.lbOwed ?? 0) > 0 && cur === st.lbCurrency
+      ? [[{ text: `සම්පූර්ණ ඉතිරිය: ${money(st.lbOwed!, cur)}`, callback_data: "lf" }]]
       : [];
     return {
       text: `${head}\n\n✏️ මුදල type කරලා එවන්න (${cur}). උදා: <code>1500</code>`,
@@ -505,6 +586,7 @@ async function postTransaction(st: State, accounts: Account[]): Promise<void> {
 
 const MENU_ROWS: Button[][] = [
   [{ text: BTN_TRANSFER, callback_data: "m:tr" }, { text: BTN_PAYLATER, callback_data: "m:pl" }],
+  [{ text: BTN_LEND, callback_data: "m:lb" }],
   [{ text: "💼 Balances", callback_data: "m:bal" }, { text: "🧾 Recent", callback_data: "m:rec" }],
   [{ text: "📊 Today", callback_data: "m:day" }, { text: "📅 This month", callback_data: "m:mon" }],
   [{ text: "🎯 Budgets", callback_data: "m:bud" }, { text: "📥 Drafts", callback_data: "m:dr" }],
@@ -902,6 +984,190 @@ async function startPayLater(chatId: number, messageId: number, type: "pl_new" |
   await show(chatId, v.text, v.rows, messageId);
 }
 
+// ---------- Lend & Borrow ----------
+
+type Contact = { id: string; person_name: string };
+type LbTx = { type: LbAction; amount: number; currency: string; base_amount: number | null; description: string; date: string; created_at: string };
+
+const LB_BACK: Button[][] = [[{ text: BTN_LEND, callback_data: "m:lb" }, { text: BTN_MENU, callback_data: "m" }]];
+
+/** Same rules as the app: positive = they owe me, negative = I owe them, in the person's currency. */
+function lbBalance(txs: LbTx[]): number {
+  return round2(txs.reduce((sum, t) => {
+    const a = Number(t.base_amount ?? t.amount);
+    return t.type === "lent" || t.type === "repaid_by_me" ? sum + a : sum - a;
+  }, 0));
+}
+/** The currency of the person's first lent/borrowed entry (null for a fresh person). */
+function lbCurrencyOf(txs: LbTx[]): string | null {
+  const firstFirst = [...txs].sort((a, b) => (a.date + a.created_at).localeCompare(b.date + b.created_at));
+  return firstFirst.find((t) => t.type === "lent" || t.type === "borrowed")?.currency ?? null;
+}
+const lbStatus = (bal: number, cur: string | null) =>
+  Math.abs(bal) < 0.005 ? "settled ✅"
+    : bal > 0 ? `එයා මට ණය ${money(bal, cur ?? undefined)}`
+    : `මම එයාට ණය ${money(-bal, cur ?? undefined)}`;
+
+async function loadContacts(): Promise<{ contact: Contact; txs: LbTx[] }[]> {
+  const { data: contacts, error } = await admin
+    .from("lending_contacts")
+    .select("id, person_name, created_at")
+    .eq("user_id", USER_ID)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  const { data: txs, error: e2 } = await admin
+    .from("lending_transactions")
+    .select("contact_id, type, amount, currency, base_amount, description, date, created_at")
+    .eq("user_id", USER_ID)
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (e2) throw e2;
+  return ((contacts ?? []) as Contact[]).map((c) => ({
+    contact: c,
+    txs: ((txs ?? []) as Tx[]).filter((t) => t.contact_id === c.id) as LbTx[],
+  }));
+}
+
+async function lendList(): Promise<{ text: string; rows: Button[][] }> {
+  const all = await loadContacts();
+  const rows: Button[][] = [];
+  const owedToMe = new Map<string, number>();
+  const iOwe = new Map<string, number>();
+  for (const { contact, txs } of all) {
+    const bal = lbBalance(txs);
+    const cur = lbCurrencyOf(txs);
+    if (cur && bal > 0) owedToMe.set(cur, (owedToMe.get(cur) ?? 0) + bal);
+    if (cur && bal < 0) iOwe.set(cur, (iOwe.get(cur) ?? 0) - bal);
+    const tag = Math.abs(bal) < 0.005 ? "✅" : bal > 0 ? `+${money(bal, cur ?? undefined)}` : `−${money(-bal, cur ?? undefined)}`;
+    rows.push([{ text: `${contact.person_name} · ${tag}`, callback_data: `lp:${contact.id.slice(0, 8)}` }]);
+  }
+  rows.push([{ text: "➕ New person", callback_data: "lp:new" }], ...BACK);
+  const lines = [
+    ...[...owedToMe].map(([c, n]) => `මට ලැබෙන්න තියෙන්නේ (${c}): <b>${money(round2(n), c)}</b>`),
+    ...[...iOwe].map(([c, n]) => `මම දෙන්න තියෙන්නේ (${c}): <b>${money(round2(n), c)}</b>`),
+  ];
+  const body = all.length
+    ? `${lines.length ? lines.join("\n") : "ඔක්කොම settled ✅"}\n\n+ = එයා මට ණය · − = මම එයාට ණය\nකෙනෙක් තෝරන්න:`
+    : "තවම කවුරුවත් නැහැ.";
+  return { text: `<b>${BTN_LEND}</b>\n\n${body}`, rows };
+}
+
+async function lendPerson(id8: string): Promise<{ text: string; rows: Button[][] } | null> {
+  const hit = (await loadContacts()).find((x) => x.contact.id.startsWith(id8));
+  if (!hit) return null;
+  const { contact, txs } = hit;
+  const bal = lbBalance(txs);
+  const cur = lbCurrencyOf(txs);
+  const lines = txs.slice(0, 6).map((t) => {
+    const label = { lent: "📤 Lent", borrowed: "📥 Borrowed", repaid_to_me: "✅ Repaid to me", repaid_by_me: "💵 I repaid" }[t.type];
+    return `${shortDate(t.date)} · ${label} ${money(Number(t.amount), t.currency)}` +
+      (t.description ? ` — ${esc(String(t.description).slice(0, 35))}` : "");
+  });
+  const id = contact.id.slice(0, 8);
+  return {
+    text:
+      `🤝 <b>${esc(contact.person_name)}</b>\n\n${lbStatus(bal, cur)}` +
+      (lines.length ? `\n\nඅන්තිම ගනුදෙනු:\n${lines.join("\n")}` : "\n\nතවම ගනුදෙනු නැහැ."),
+    rows: [
+      [{ text: LB_LABEL.lent, callback_data: `la:${id}:l` }, { text: LB_LABEL.borrowed, callback_data: `la:${id}:b` }],
+      [{ text: LB_LABEL.repaid_to_me, callback_data: `la:${id}:t` }, { text: LB_LABEL.repaid_by_me, callback_data: `la:${id}:m` }],
+      ...LB_BACK,
+    ],
+  };
+}
+
+async function startLend(chatId: number, messageId: number, id8: string, code: string) {
+  const action = ({ l: "lent", b: "borrowed", t: "repaid_to_me", m: "repaid_by_me" } as Record<string, LbAction>)[code];
+  const hit = (await loadContacts()).find((x) => x.contact.id.startsWith(id8));
+  if (!action || !hit) return show(chatId, "ඒ කෙනාව හොයාගන්න බැරි උනා.", LB_BACK, messageId);
+  const bal = lbBalance(hit.txs);
+  const owed = action === "repaid_to_me" ? bal : action === "repaid_by_me" ? -bal : 0;
+  const st: State = {
+    step: "lb_wallet",
+    type: "lb_tx",
+    contactId: hit.contact.id,
+    lbName: hit.contact.person_name,
+    lbAction: action,
+    lbCurrency: lbCurrencyOf(hit.txs),
+    lbOwed: owed > 0.004 ? round2(owed) : undefined,
+  };
+  const accounts = await loadAccounts();
+  settle(st, accounts);
+  await saveSession(chatId, st);
+  const v = view(st, accounts, []);
+  await show(chatId, v.text, v.rows, messageId);
+}
+
+async function createContact(st: State): Promise<string> {
+  const { data, error } = await admin
+    .from("lending_contacts")
+    .insert({ user_id: USER_ID, person_name: st.lbName, notes: "" })
+    .select("id")
+    .single();
+  if (error || !data) throw error ?? new Error("insert failed");
+  return data.id as string;
+}
+
+/**
+ * Record a lend/borrow entry the way the app does: the lending row, and when a
+ * wallet is chosen, its balance change plus a "Lend & Borrow" transaction in
+ * the main ledger. Anything written before a failure is removed again.
+ */
+async function addLending(st: State, accounts: Account[]): Promise<void> {
+  if (!st.contactId || !st.lbAction || st.amount == null) throw new Error("incomplete entry");
+  const wallet = accounts.find((a) => a.id === st.accountId);
+  const currency = wallet?.currency ?? st.currency ?? st.lbCurrency ?? "LKR";
+  const amount = round2(st.amount);
+  const cross = st.lbCurrency != null && currency !== st.lbCurrency && st.base != null;
+  const date = await todayForUser();
+
+  const { data: row, error } = await admin
+    .from("lending_transactions")
+    .insert({
+      user_id: USER_ID,
+      contact_id: st.contactId,
+      type: st.lbAction,
+      amount,
+      currency,
+      exchange_rate: cross ? st.base! / amount : null,
+      base_amount: cross ? round2(st.base!) : null,
+      description: st.description ?? "",
+      date,
+      account_id: wallet?.id ?? null,
+    })
+    .select("id")
+    .single();
+  if (error || !row) throw error ?? new Error("insert failed");
+  if (!wallet) return;
+
+  const out = st.lbAction === "lent" || st.lbAction === "repaid_by_me";
+  const label = { lent: "Lent", borrowed: "Borrowed", repaid_to_me: "Repaid to me", repaid_by_me: "I repaid" }[st.lbAction];
+  let txId: string | null = null;
+  try {
+    const { data: tx, error: e2 } = await admin
+      .from("transactions")
+      .insert({
+        user_id: USER_ID,
+        account_id: wallet.id,
+        type: out ? "expense" : "income",
+        amount,
+        currency,
+        category: "Lend & Borrow",
+        description: [label, st.lbName, st.description].filter(Boolean).join(" — "),
+        date,
+      })
+      .select("id")
+      .single();
+    if (e2 || !tx) throw e2 ?? new Error("insert failed");
+    txId = tx.id as string;
+    await updateBalance(wallet.id, out ? -amount : amount);
+  } catch (e) {
+    if (txId) await admin.from("transactions").delete().eq("id", txId);
+    await admin.from("lending_transactions").delete().eq("id", row.id);
+    throw e;
+  }
+}
+
 async function onMenu(chatId: number, messageId: number, data: string) {
   if (data === "m") return show(chatId, MENU_TEXT, MENU_ROWS, messageId);
   if (data === "m:tr") return startEntry(chatId, "transfer", messageId);
@@ -912,6 +1178,25 @@ async function onMenu(chatId: number, messageId: number, data: string) {
       return await show(chatId, v.text, v.rows, messageId);
     }
     if (data === "pl:new") return await startPayLater(chatId, messageId, "pl_new");
+    if (data === "m:lb") {
+      const v = await lendList();
+      return await show(chatId, v.text, v.rows, messageId);
+    }
+    if (data === "lp:new") {
+      const st: State = { step: "lb_name", type: "lb_new" };
+      await saveSession(chatId, st);
+      const v = view(st, [], []);
+      return await show(chatId, v.text, v.rows, messageId);
+    }
+    if (data.startsWith("lp:")) {
+      const v = await lendPerson(data.slice(3));
+      if (!v) return await show(chatId, "ඒ කෙනාව හොයාගන්න බැරි උනා.", LB_BACK, messageId);
+      return await show(chatId, v.text, v.rows, messageId);
+    }
+    if (data.startsWith("la:")) {
+      const [, id8, code] = data.split(":");
+      return await startLend(chatId, messageId, id8, code);
+    }
     if (data.startsWith("pl:") || data.startsWith("pp:") || data.startsWith("py:")) {
       const tab = await findTab(data.slice(3));
       if (!tab) return await show(chatId, "ඒ tab එක හොයාගන්න බැරි උනා.", PL_BACK, messageId);
@@ -938,6 +1223,14 @@ async function onMenu(chatId: number, messageId: number, data: string) {
       const tx = await lastTransaction();
       if (!tx) return await show(chatId, "↩️ <b>Undo last</b>\n\nගනුදෙනු නැහැ.", BACK, messageId);
       const line = txLine(tx, await accountNames());
+      if (tx.category === "Lend & Borrow") {
+        return await show(
+          chatId,
+          `↩️ <b>Undo last</b>\n\n${line}\n\nමේක Lend & Borrow ගනුදෙනුවක්. App එකේ Lend & Borrow එකෙන් ඒක delete කරන්න.`,
+          BACK,
+          messageId,
+        );
+      }
       if (String(tx.description ?? "").startsWith("Pay Later")) {
         return await show(
           chatId,
@@ -967,7 +1260,7 @@ async function onMenu(chatId: number, messageId: number, data: string) {
       // Only ever undo the one that was shown; if something newer exists, stop.
       if (
         !tx || !String(tx.id).startsWith(data.slice(2)) || tx.debt_id || tx.investment_id ||
-        String(tx.description ?? "").startsWith("Pay Later")
+        String(tx.description ?? "").startsWith("Pay Later") || tx.category === "Lend & Borrow"
       ) {
         return await show(chatId, "↩️ ඒ transaction එක දැන් අන්තිම එක නෙවෙයි, නැත්නම් දැනටමත් delete වෙලා. කිසිම දෙයක් වෙනස් කළේ නැහැ.", BACK, messageId);
       }
@@ -1031,7 +1324,7 @@ async function onText(chatId: number, text: string) {
 
   // Otherwise the text is an answer to "type the amount" / "type a note".
   const st = await loadSession(chatId);
-  if (!st || !["amount", "received", "note", "newcat_name", "pl_name"].includes(st.step)) {
+  if (!st || !["amount", "received", "note", "newcat_name", "pl_name", "lb_name", "lb_base"].includes(st.step)) {
     await sendMenu(chatId, "යට තියෙන බොත්තමකින් පටන් ගන්න: Expense, Income, Menu.");
     return;
   }
@@ -1043,6 +1336,9 @@ async function onText(chatId: number, text: string) {
   } else if (st.step === "pl_name") {
     if (t.startsWith("/")) return;
     st.plName = t.replace(/\s+/g, " ").slice(0, 60);
+  } else if (st.step === "lb_name") {
+    if (t.startsWith("/")) return;
+    st.lbName = t.replace(/\s+/g, " ").slice(0, 60);
   } else if (st.step === "newcat_name") {
     const name = t.replace(/\s+/g, " ").trim();
     if (!name || name.startsWith("/") || name.includes(">")) {
@@ -1081,6 +1377,7 @@ async function onText(chatId: number, text: string) {
       return;
     }
     if (st.step === "amount") st.amount = n;
+    else if (st.step === "lb_base") st.base = n;
     else st.received = n;
   }
 
@@ -1100,7 +1397,8 @@ async function onCallback(chatId: number, messageId: number, data: string) {
   // Menu screens and undo do not belong to an entry in progress.
   if (
     data === "m" || data.startsWith("m:") || data.startsWith("u:") ||
-    data.startsWith("pl:") || data.startsWith("pp:") || data.startsWith("py:")
+    data.startsWith("pl:") || data.startsWith("pp:") || data.startsWith("py:") ||
+    data.startsWith("lp:") || data.startsWith("la:")
   ) {
     await onMenu(chatId, messageId, data);
     return;
@@ -1128,6 +1426,8 @@ async function onCallback(chatId: number, messageId: number, data: string) {
       if (st.type === "pl_new") st.tabId = (await createTab(st)).id;
       else if (st.type === "pl_buy") await addPurchase(st);
       else if (st.type === "pl_pay") await addPayment(st);
+      else if (st.type === "lb_new") st.contactId = await createContact(st);
+      else if (st.type === "lb_tx") await addLending(st, accounts);
       else await postTransaction(st, accounts);
     } catch (e) {
       console.error("postTransaction", e);
@@ -1136,6 +1436,13 @@ async function onCallback(chatId: number, messageId: number, data: string) {
         message_id: messageId,
         text: "⚠️ Save කරන්න බැරි උනා, කිසිම දෙයක් වෙනස් වෙලා නැහැ. ආයෙ උත්සාහ කරන්න.",
       });
+      return;
+    }
+    if (st.contactId) {
+      // Lend & Borrow: show the person (with their action buttons) under the receipt.
+      const v = await lendPerson(st.contactId.slice(0, 8));
+      await show(chatId, `✅ <b>Save උනා</b>\n\n${summary}`, [], messageId);
+      if (v) await show(chatId, v.text, v.rows);
       return;
     }
     if (st.tabId) {
@@ -1199,6 +1506,19 @@ async function onCallback(chatId: number, messageId: number, data: string) {
     const acc = accounts.find((a) => a.id.startsWith(data.slice(2)) && a.currency === st.currency);
     if (!acc) return;
     st.accountId = acc.id;
+  } else if (data === "lw:none" && st.step === "lb_wallet") {
+    st.noWallet = true;
+  } else if (data.startsWith("lw:") && st.step === "lb_wallet") {
+    const acc = accounts.find((a) => a.id.startsWith(data.slice(3)));
+    if (!acc) return;
+    st.accountId = acc.id;
+    st.currency = acc.currency;
+  } else if (data.startsWith("lc:") && st.step === "lb_cur") {
+    const cur = data.slice(3);
+    if (!accounts.some((a) => a.currency === cur)) return;
+    st.currency = cur;
+  } else if (data === "lf" && st.step === "amount" && st.type === "lb_tx" && (st.lbOwed ?? 0) > 0) {
+    st.amount = st.lbOwed;
   } else if (data === "n" && st.step === "note") {
     st.description = "";
   } else {
