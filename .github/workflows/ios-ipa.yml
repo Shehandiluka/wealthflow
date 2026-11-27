@@ -1,0 +1,75 @@
+name: iOS IPA
+
+# Builds an unsigned WealthFlow.ipa for sideloading (SideStore / 3uTools /
+# Sideloadly sign it with your own Apple ID). The IPA is attached to the run
+# and also pushed to the `ipa` branch as WealthFlow.ipa.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - capacitor.config.ts
+      - resources/**
+      - .github/workflows/ios-ipa.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Create iOS project
+        run: |
+          npx cap add ios
+          npx capacitor-assets generate --ios --assetPath resources
+          npx cap sync ios
+
+      - name: App version
+        run: |
+          PLIST=ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.${{ github.run_number }}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || true
+
+      - name: Build (unsigned)
+        run: |
+          cd ios/App
+          if [ -d App.xcworkspace ]; then SRC="-workspace App.xcworkspace"; else SRC="-project App.xcodeproj"; fi
+          xcodebuild $SRC -scheme App -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -40
+
+      - name: Package IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" "$RUNNER_TEMP/out/Payload/"
+          cd "$RUNNER_TEMP/out" && zip -qry WealthFlow.ipa Payload
+          ls -l WealthFlow.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WealthFlow-ipa
+          path: ${{ runner.temp }}/out/WealthFlow.ipa
+
+      - name: Publish to the ipa branch
+        run: |
+          mkdir -p "$RUNNER_TEMP/pub" && cd "$RUNNER_TEMP/pub"
+          git init -q -b ipa
+          cp "$RUNNER_TEMP/out/WealthFlow.ipa" ./
+          echo "Build ${{ github.run_number }} from ${{ github.sha }}" > BUILD.txt
+          git add WealthFlow.ipa BUILD.txt
+          git -c user.name="github-actions" -c user.email="actions@github.com" commit -qm "WealthFlow.ipa build ${{ github.run_number }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ipa
