@@ -7,6 +7,7 @@ import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/hooks/use-toast";
 import { motion } from "framer-motion";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
+import { isNativeApp, WEB_ORIGIN } from "@/lib/native";
 
 export default function AuthPage() {
   const [isLogin, setIsLogin] = useState(true);
@@ -32,7 +33,7 @@ export default function AuthPage() {
           password,
           options: {
             data: { display_name: displayName || email },
-            emailRedirectTo: window.location.origin,
+            emailRedirectTo: WEB_ORIGIN,
           },
         });
         if (error) throw error;
@@ -125,6 +126,9 @@ export default function AuthPage() {
             </Button>
           </form>
 
+          {/* Google blocks sign-in inside apps' built-in web views, so the iOS
+              app offers e-mail sign-in only. */}
+          {!isNativeApp && (<>
           <div className="flex items-center gap-3">
             <Separator className="flex-1" />
             <span className="text-xs text-muted-foreground">or</span>
@@ -138,7 +142,7 @@ export default function AuthPage() {
             onClick={async () => {
               const { error } = await supabase.auth.signInWithOAuth({
                 provider: "google",
-                options: { redirectTo: window.location.origin },
+                options: { redirectTo: WEB_ORIGIN },
               });
               if (error) {
                 toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -153,6 +157,7 @@ export default function AuthPage() {
             </svg>
             Continue with Google
           </Button>
+          </>)}
 
           <p className="text-center text-sm text-muted-foreground">
             {isLogin ? "Don't have an account?" : "Already have an account?"}{" "}

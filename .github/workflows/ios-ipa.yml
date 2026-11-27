@@ -8,6 +8,10 @@ on:
   push:
     branches: [main]
     paths:
+      - src/**
+      - public/**
+      - index.html
+      - package.json
       - capacitor.config.ts
       - resources/**
       - .github/workflows/ios-ipa.yml

@@ -1,16 +1,12 @@
 import type { CapacitorConfig } from "@capacitor/cli";
 
-// iOS app shell for WealthFlow. The app loads the live site, so every web
-// deploy reaches the phone without a new IPA. dist/ is bundled as a fallback
-// copy of the web assets.
+// iOS app for WealthFlow. The whole app (dist/) is bundled inside the IPA and
+// runs from the phone itself — it does not load the website. It talks to the
+// same Supabase backend, so data is shared with the web version.
 const config: CapacitorConfig = {
   appId: "com.swiftlk.wealthflow",
   appName: "WealthFlow",
   webDir: "dist",
-  server: {
-    url: "https://wealthflow.shehandsandeep.workers.dev",
-    cleartext: false,
-  },
   ios: {
     contentInset: "never",
     backgroundColor: "#0b1220",
@@ -18,6 +14,12 @@ const config: CapacitorConfig = {
   },
   plugins: {
     StatusBar: { overlaysWebView: true, style: "DARK" },
+    SplashScreen: {
+      launchAutoHide: true,
+      launchShowDuration: 1200,
+      backgroundColor: "#0b1220",
+      showSpinner: false,
+    },
   },
 };
 
