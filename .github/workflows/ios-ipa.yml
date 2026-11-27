@@ -1,8 +1,9 @@
 name: iOS IPA
 
 # Builds an unsigned WealthFlow.ipa for sideloading (SideStore / 3uTools /
-# Sideloadly sign it with your own Apple ID). The IPA is attached to the run
-# and also pushed to the `ipa` branch as WealthFlow.ipa.
+# Sideloadly sign it with your own Apple ID) and publishes it as a GitHub
+# release together with altstore.json, the SideStore source:
+#   https://github.com/Shehandiluka/wealthflow/releases/latest/download/altstore.json
 on:
   workflow_dispatch:
   push:
@@ -68,12 +69,48 @@ jobs:
           name: WealthFlow-ipa
           path: ${{ runner.temp }}/out/WealthFlow.ipa
 
-      - name: Publish to the ipa branch
+      - name: SideStore / AltStore source
+        env:
+          RUN: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
         run: |
-          mkdir -p "$RUNNER_TEMP/pub" && cd "$RUNNER_TEMP/pub"
-          git init -q -b ipa
-          cp "$RUNNER_TEMP/out/WealthFlow.ipa" ./
-          echo "Build ${{ github.run_number }} from ${{ github.sha }}" > BUILD.txt
-          git add WealthFlow.ipa BUILD.txt
-          git -c user.name="github-actions" -c user.email="actions@github.com" commit -qm "WealthFlow.ipa build ${{ github.run_number }}"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ipa
+          cd "$RUNNER_TEMP/out"
+          git -C "$GITHUB_WORKSPACE" log -1 --pretty=%B | grep -vE '^(Co-Authored-By|Claude-Session):' | sed '/^\s*$/d' > notes.txt
+          python3 - <<'PY'
+          import json, os, datetime
+          run, repo = os.environ["RUN"], os.environ["REPO"]
+          ver = f"1.0.{run}"
+          tag = f"v{ver}"
+          ipa = f"https://github.com/{repo}/releases/download/{tag}/WealthFlow.ipa"
+          icon = f"https://raw.githubusercontent.com/{repo}/main/resources/icon.png"
+          size = os.path.getsize("WealthFlow.ipa")
+          notes = "\n".join(l.strip() for l in open("notes.txt") if l.strip())
+          now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+          src = {
+            "name": "WealthFlow", "identifier": "com.swiftlk.wealthflow.source",
+            "subtitle": "Money manager by Swift", "iconURL": icon, "website": "https://swiftlk.com",
+            "tintColor": "1FC7A5",
+            "apps": [{
+              "name": "WealthFlow", "bundleIdentifier": "com.swiftlk.wealthflow",
+              "developerName": "SwiftPayPOS (Private) Limited",
+              "subtitle": "Wallets, budgets, debts and Telegram entry",
+              "localizedDescription": "Personal money manager: wallets in many currencies, budgets, debts, pay later, lend & borrow, investments, trips and reports.",
+              "iconURL": icon, "tintColor": "1FC7A5", "category": "utilities",
+              "versions": [{"version": ver, "buildVersion": run, "date": now, "localizedDescription": notes,
+                            "downloadURL": ipa, "size": size, "minOSVersion": "14.0"}],
+              "appPermissions": {"entitlements": [], "privacy": {}},
+            }],
+            "news": [],
+          }
+          json.dump(src, open("altstore.json", "w"), ensure_ascii=False, indent=1)
+          open(os.environ["GITHUB_ENV"], "a").write(f"TAG={tag}\n")
+          PY
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/out"
+          gh release create "$TAG" WealthFlow.ipa altstore.json \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "WealthFlow $TAG" --notes-file notes.txt --latest
